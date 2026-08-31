@@ -68,6 +68,32 @@ function nextInstallationId() {
   return installationSequence;
 }
 
+const planReviewIssue = async ({ issue_number }: { issue_number: number }) => ({
+  data: {
+    number: issue_number,
+    title: "Architect plan review",
+    body: "Review the published plan",
+    state: "open",
+    html_url: `https://github.test/issues/${issue_number}`,
+    user: { login: "maintainer" },
+    labels: [],
+  },
+});
+
+function planReviewRepos() {
+  return {
+    getBranch: async () => ({ data: { commit: { sha: "e".repeat(40) } } }),
+    compareCommitsWithBasehead: async () => ({
+      data: {
+        status: "ahead",
+        ahead_by: 1,
+        behind_by: 0,
+        files: [{ filename: "services/api/src/routes/v1/hitl.ts" }],
+      },
+    }),
+  };
+}
+
 type IssueBackfillRecord = {
   number: number;
   pull_request: Record<string, never>;
@@ -4838,6 +4864,7 @@ describe("github platform lane", async () => {
       ({
         rest: {
           issues: {
+            get: planReviewIssue,
             listComments: async () => ({ data: [] }),
             createComment: async ({ body }: { body: string }) => {
               comments.push(body);
@@ -4848,7 +4875,7 @@ describe("github platform lane", async () => {
               throw Object.assign(new Error("progress comment deleted"), { status: 404 });
             },
           },
-          repos: {},
+          repos: planReviewRepos(),
           pulls: {},
           git: {},
         },
@@ -4886,6 +4913,8 @@ describe("github platform lane", async () => {
     expect(missingProgressUpdates).toBe(1);
     expect(comments).toHaveLength(1);
     expect(comments.at(-1)).toContain("Human Gate 1");
+    expect(comments.at(-1)).toContain("## Review context");
+    expect(comments.at(-1)).toContain("Currently presented");
     expect(comments.at(-1)).toContain("Prove it with the mirror test");
     expect(comments.at(-1)).toContain("<!-- facility:architect-plan:");
     const [proposal] = await db.select().from(proposals).where(eq(proposals.runId, run.id));
@@ -4896,6 +4925,25 @@ describe("github platform lane", async () => {
       workspaceBaseSha,
       issueRevisionSha256: githubIssueRevisionSha256(issueRequest),
     });
+    const published = (
+      await db
+        .select({ data: proposalEvents.data })
+        .from(proposalEvents)
+        .where(
+          and(
+            eq(proposalEvents.proposalId, proposal?.id ?? ""),
+            eq(proposalEvents.type, "published"),
+          ),
+        )
+        .limit(1)
+    )[0];
+    expect(published?.data).toMatchObject({
+      reviewContext: {
+        source: "github_plan_comment",
+        status: "available",
+        repository: { id: repo.id, owner: repo.owner, name: repo.name },
+      },
+    });
   });
 
   it("keeps a sealed Architect success durable and retries transient plan publication", async () => {
@@ -4903,6 +4951,7 @@ describe("github platform lane", async () => {
     const run = await insertRun({
       mode: "architect",
       status: "running",
+      workspaceBaseSha: "d".repeat(40),
       gh: { owner: repo.owner, repo: repo.name, issueNumber: 72 },
     });
     await db.insert(runEvents).values({
@@ -4963,6 +5012,7 @@ describe("github platform lane", async () => {
       return {
         rest: {
           issues: {
+            get: planReviewIssue,
             createComment: async ({ body }: { body: string }) => {
               comments.push(body);
               await new Promise((resolve) => setTimeout(resolve, 5));
@@ -4973,7 +5023,7 @@ describe("github platform lane", async () => {
               return { data: { id: comment_id } };
             },
           },
-          repos: {},
+          repos: planReviewRepos(),
           pulls: {},
           git: {},
         },
@@ -5063,6 +5113,7 @@ describe("github platform lane", async () => {
     const run = await insertRun({
       mode: "architect",
       status: "running",
+      workspaceBaseSha: "d".repeat(40),
       gh: { owner: repo.owner, repo: repo.name, issueNumber: 73 },
     });
     await db.insert(runEvents).values({
@@ -5091,6 +5142,7 @@ describe("github platform lane", async () => {
           ({
             rest: {
               issues: {
+                get: planReviewIssue,
                 listComments: async () => ({ data: [] }),
                 createComment: async ({ body }: { body: string }) => {
                   creates += 1;
@@ -5104,7 +5156,7 @@ describe("github platform lane", async () => {
                   throw new Error("connection closed after GitHub accepted the comment");
                 },
               },
-              repos: {},
+              repos: planReviewRepos(),
               pulls: {},
               git: {},
             },
@@ -5212,6 +5264,7 @@ describe("github platform lane", async () => {
     const run = await insertRun({
       mode: "architect",
       status: "running",
+      workspaceBaseSha: "d".repeat(40),
       gh: { owner: repo.owner, repo: repo.name, issueNumber: 75 },
     });
     await db.insert(runEvents).values({
@@ -5244,6 +5297,7 @@ describe("github platform lane", async () => {
       return {
         rest: {
           issues: {
+            get: planReviewIssue,
             listComments: async () => ({ data: remoteComments }),
             createComment: async ({ body }: { body: string }) => {
               remoteComments.push({
@@ -5262,7 +5316,7 @@ describe("github platform lane", async () => {
               return { data: { id: comment_id, html_url: comment?.html_url } };
             },
           },
-          repos: {},
+          repos: planReviewRepos(),
           pulls: {},
           git: {},
         },
@@ -5306,6 +5360,7 @@ describe("github platform lane", async () => {
       const run = await insertRun({
         mode: "architect",
         status: "running",
+        workspaceBaseSha: "d".repeat(40),
         gh: {
           owner: repo.owner,
           repo: repo.name,
@@ -5339,13 +5394,14 @@ describe("github platform lane", async () => {
             ({
               rest: {
                 issues: {
+                  get: planReviewIssue,
                   listComments: async () => ({ data: [] }),
                   createComment: async () => ({ data: { id: issueNumber * 100 } }),
                   updateComment: async ({ comment_id }: { comment_id: number }) => ({
                     data: { id: comment_id },
                   }),
                 },
-                repos: {},
+                repos: planReviewRepos(),
                 pulls: {},
                 git: {},
               },
@@ -5632,6 +5688,7 @@ describe("github platform lane", async () => {
           mode: "architect",
           engine: "codex",
           status: "running",
+          workspaceBaseSha: "d".repeat(40),
           trigger: {},
           gh: { owner: "fairness-owner", repo: "repo", issueNumber: 99 },
           createdBy: { type: "user", id: "fairness-human" },
@@ -5678,13 +5735,14 @@ describe("github platform lane", async () => {
       return {
         rest: {
           issues: {
+            get: planReviewIssue,
             listComments: async () => ({ data: [] }),
             createComment: async ({ issue_number }: { issue_number: number }) => {
               if (issue_number === 99) creates += 1;
               return { data: { id: 9901 } };
             },
           },
-          repos: {},
+          repos: planReviewRepos(),
           pulls: {},
           git: {},
         },

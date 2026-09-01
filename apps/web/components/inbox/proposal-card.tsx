@@ -8,6 +8,12 @@ import type { Proposal, ProposalReviewContext } from "@/lib/api";
 
 type ReviewContext = ProposalReviewContext["reviewContext"];
 
+export function requestProposalReviewContext(proposalId: string, fetchImpl: typeof fetch = fetch) {
+  return fetchImpl(`/api/v1/proposals/${proposalId}/review-context`, {
+    method: "POST",
+  });
+}
+
 /**
  * A gate in card form: the evidence inline, the decision one tap.
  * Decisions hit the HITL ledger and are fully audited.
@@ -31,10 +37,7 @@ export function ProposalCard({ proposal, focused }: { proposal: Proposal; focuse
     }
     setBusy(decision);
     try {
-      const res = await fetch(`/api/v1/proposals/${proposal.id}/review-context`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-      });
+      const res = await requestProposalReviewContext(proposal.id);
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as {
           error?: { message?: string };

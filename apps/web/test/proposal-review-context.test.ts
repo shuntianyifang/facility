@@ -1,7 +1,7 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
-import { ReviewContextPanel } from "@/components/inbox/proposal-card";
+import { describe, expect, it, vi } from "vitest";
+import { ReviewContextPanel, requestProposalReviewContext } from "@/components/inbox/proposal-card";
 import type { ProposalReviewContext } from "@/lib/api";
 
 type ReviewContext = ProposalReviewContext["reviewContext"];
@@ -21,6 +21,18 @@ function render(context: ReviewContext) {
 }
 
 describe("proposal review context", () => {
+  it("does not advertise an empty JSON body when requesting review evidence", async () => {
+    const fetchImpl = vi.fn(async () =>
+      Response.json({ reviewContextSeq: 2, reviewContext: {} }),
+    ) as typeof fetch;
+
+    await requestProposalReviewContext("prop_1", fetchImpl);
+
+    expect(fetchImpl).toHaveBeenCalledWith("/api/v1/proposals/prop_1/review-context", {
+      method: "POST",
+    });
+  });
+
   it("renders the exact repository state shown for an available review", () => {
     const html = render({
       ...common,

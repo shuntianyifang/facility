@@ -63,6 +63,7 @@ export type Octokit = {
           head?: { ref?: string; sha?: string };
           base?: { ref?: string };
         }>;
+        headers?: { link?: string };
       }>;
       update: (args: Record<string, unknown>) => Promise<{ data: unknown }>;
       listReviews?: (args: Record<string, unknown>) => Promise<{ data: unknown[] }>;
@@ -167,7 +168,7 @@ export type GithubInstallationTokenFactory = (input: {
   owner: string;
   repo: string;
   permissions?: Record<string, string>;
-}) => Promise<string>;
+}) => Promise<{ token: string; expiresAt: string }>;
 
 export class GithubIssueContextTooLargeError extends Error {
   constructor() {
@@ -248,7 +249,17 @@ export function createGithubInstallationTokenFactory(
         ...(permissions ? { permissions } : {}),
       },
     );
-    return response.data.token;
+    const token = response.data.token;
+    const expiresAt = response.data.expires_at;
+    if (
+      typeof token !== "string" ||
+      token.length === 0 ||
+      typeof expiresAt !== "string" ||
+      !Number.isFinite(new Date(expiresAt).getTime())
+    ) {
+      throw new Error("GitHub installation token response omitted an exact expiry");
+    }
+    return { token, expiresAt };
   };
 }
 
@@ -317,6 +328,22 @@ export class FacilityGithubClient {
       branch: this.repo.defaultBranch,
     });
     return response.data.commit.sha;
+  }
+
+  async assertRepositoryAccessible(): Promise<void> {
+    if (!this.octokit.rest.repos.get) {
+      throw new Error("GitHub repository lookup is unavailable");
+    }
+    const response = await this.octokit.rest.repos.get({
+      owner: this.repo.owner,
+      repo: this.repo.repo,
+    });
+    if (
+      response.data.name.toLowerCase() !== this.repo.repo.toLowerCase() ||
+      response.data.owner?.login?.toLowerCase() !== this.repo.owner.toLowerCase()
+    ) {
+      throw new Error("GitHub repository identity is unavailable");
+    }
   }
 
   async getRef(branch: string): Promise<string> {
@@ -471,6 +498,25 @@ export class FacilityGithubClient {
     });
   }
 
+  async listPullRequestsForHead(
+    head: string,
+  ): Promise<{ pullRequests: unknown[]; hasNextPage: boolean }> {
+    if (!this.octokit.rest.pulls.list) {
+      throw new Error("GitHub pull-request lookup is unavailable");
+    }
+    const response = await this.octokit.rest.pulls.list({
+      owner: this.repo.owner,
+      repo: this.repo.repo,
+      state: "all",
+      head: `${this.repo.owner}:${head}`,
+      per_page: GITHUB_EVIDENCE_PAGE_SIZE,
+    });
+    return {
+      pullRequests: response.data,
+      hasNextPage: /rel="next"/.test(response.headers?.link ?? ""),
+    };
+  }
+
   async getPullRequestDeliveryRef(number: number): Promise<{
     number: number;
     url: string;
@@ -496,6 +542,40 @@ export class FacilityGithubClient {
       headRef: head.ref,
       headSha: head.sha,
       baseRef: base.ref,
+    };
+  }
+
+  async getPullRequestWriteTarget(number: number): Promise<{
+    number: number;
+    state: string;
+    mergedAt: string | null;
+    headRef: string;
+    headSha: string;
+    headRepo: string;
+    baseRef: string;
+    baseRepo: string;
+  }> {
+    if (!this.octokit.rest.pulls.get) {
+      throw new Error("GitHub pull-request lookup is unavailable");
+    }
+    const response = await this.octokit.rest.pulls.get({
+      owner: this.repo.owner,
+      repo: this.repo.repo,
+      pull_number: number,
+    });
+    const { head, base } = response.data;
+    if (!head?.ref || !head.sha || !head.repo?.full_name || !base?.ref || !base.repo?.full_name) {
+      throw new Error("GitHub pull-request write target is unavailable");
+    }
+    return {
+      number: response.data.number,
+      state: response.data.state,
+      mergedAt: response.data.merged_at ?? null,
+      headRef: head.ref,
+      headSha: head.sha,
+      headRepo: head.repo.full_name,
+      baseRef: base.ref,
+      baseRepo: base.repo.full_name,
     };
   }
 

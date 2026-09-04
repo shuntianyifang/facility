@@ -247,6 +247,16 @@ export async function registerHitlRoutes(app: FastifyInstance, context: V1RouteC
       if (!can(p.permissions, body.permission)) {
         throw new ApiError(403, "forbidden", "Permission denied", { needed: body.permission });
       }
+      // Deferred execution outlives this request lease. Keep run credentials
+      // fail-closed until the executor can hold and revalidate the same run
+      // lease for the full deferred side effect.
+      if (p.runId) {
+        throw new ApiError(
+          403,
+          "run_key_deferred_mcp_forbidden",
+          "Run-scoped platform keys cannot create deferred MCP proposals",
+        );
+      }
       if (can(p.permissions, "hitl:decide")) {
         throw new ApiError(
           403,
@@ -561,7 +571,12 @@ export async function registerHitlRoutes(app: FastifyInstance, context: V1RouteC
           db,
           row,
           { type: p.type, id: p.id },
-          { config, enqueue: app.enqueue, githubFactory: app.githubClientFactory },
+          {
+            config,
+            transitionDb: app.runTransitionDb,
+            enqueue: app.enqueue,
+            githubFactory: app.githubClientFactory,
+          },
         );
         const executed = (
           await db
@@ -608,6 +623,7 @@ export async function registerHitlRoutes(app: FastifyInstance, context: V1RouteC
         { type: p.type, id: p.id },
         {
           config,
+          transitionDb: app.runTransitionDb,
           enqueue: app.enqueue,
           githubFactory: app.githubClientFactory,
         },

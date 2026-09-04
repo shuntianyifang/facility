@@ -61,7 +61,8 @@ jobs:
       # Provisioned job site, so the agent can verify before pushing.
       - name: Provision environment
         if: steps.workflow-change.outputs.changed != 'true'
-        run: {{PROVISION_CMD}}
+        run: |
+{{PROVISION_RUN}}
 
 {{ANTHROPIC_AUTH_SETUP_CONDITIONAL}}
 

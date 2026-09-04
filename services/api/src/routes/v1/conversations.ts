@@ -10,7 +10,10 @@ import {
 import { and, desc, eq, sql } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { withBuilderPlanPreflight } from "../../builder-plan-policy.js";
+import {
+  assertGenericRunResumeAllowed,
+  withBuilderPlanPreflight,
+} from "../../builder-plan-policy.js";
 import { ApiError, notFound } from "../../errors.js";
 import {
   assertBareRowProjectScope,
@@ -221,6 +224,22 @@ export async function registerConversationsRoutes(app: FastifyInstance, context:
               .returning()
           )[0];
           if (!claimed) return null;
+          if (claimed.engineSessionId && claimed.lastRunId) {
+            const parent = (
+              await tx
+                .select()
+                .from(runs)
+                .where(
+                  and(
+                    eq(runs.orgId, claimed.orgId),
+                    eq(runs.projectId, claimed.projectId),
+                    eq(runs.id, claimed.lastRunId),
+                  ),
+                )
+                .limit(1)
+            )[0];
+            if (parent) await assertGenericRunResumeAllowed(tx, parent);
+          }
           const rows = await tx
             .select({ max: sql<number>`coalesce(max(seq), 0)` })
             .from(conversationMessages)

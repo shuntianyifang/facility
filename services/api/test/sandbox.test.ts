@@ -22,6 +22,7 @@ import {
   registryVersions,
   repos,
   roles,
+  runDeliveries,
   runEvents,
   runs,
   sandboxProfiles,
@@ -1159,6 +1160,137 @@ describe("sandbox api", async () => {
     expect(stored?.engineSessionId).toBe("sess_finish_123");
   });
 
+  it("claims terminal evidence after the lease, preserves provider state, and revokes atomically", async () => {
+    const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+    const owner = `terminal-atomic-${suffix}`;
+    const [installation] = await db
+      .insert(githubInstallations)
+      .values({
+        id: newId("int"),
+        orgId,
+        installationId: Date.now() + 20_000,
+        accountLogin: owner,
+        targetType: "Organization",
+      })
+      .returning();
+    if (!installation) throw new Error("terminal installation fixture missing");
+    const [repo] = await db
+      .insert(repos)
+      .values({
+        id: newId("repo"),
+        orgId,
+        projectId,
+        installationId: installation.id,
+        owner,
+        name: `repo-${suffix}`,
+        defaultBranch: "main",
+      })
+      .returning();
+    if (!repo) throw new Error("terminal repository fixture missing");
+    const runId = newId("run");
+    const staleRun = await insertRunnerRun(`frt_terminal_atomic_${suffix}`, "running", runId);
+    const virtualKeyId = newId("vkey");
+    await db.insert(virtualKeys).values({
+      id: virtualKeyId,
+      orgId,
+      projectId,
+      runId,
+      name: "terminal atomic virtual key",
+      prefix: `terminal_v_${suffix}`,
+      last4: "0000",
+      hash: `terminal-v-hash-${suffix}`,
+    });
+    const roleId = newId("key");
+    await db.insert(roles).values({
+      id: roleId,
+      orgId,
+      name: `terminal-atomic-role-${suffix}`,
+      permissions: [],
+    });
+    const platformKeyId = newId("key");
+    await db.insert(apiKeys).values({
+      id: platformKeyId,
+      orgId,
+      projectId,
+      roleId,
+      runId,
+      name: "terminal atomic platform key",
+      prefix: `terminal_p_${suffix}`,
+      last4: "0000",
+      hash: `terminal-p-hash-${suffix}`,
+      scopeType: "project",
+    });
+    const providerRef = `provider-ref-${suffix}`;
+    await db
+      .update(runs)
+      .set({
+        gh: { owner, repo: repo.name, issueNumber: 91 },
+        // This ref is deliberately attached after staleRun was read, matching
+        // a fast provider whose launch() returns after /result authenticated.
+        sandbox: sql`${runs.sandbox} || ${JSON.stringify({
+          virtualKeyId,
+          platformKeyId,
+          ref: providerRef,
+          launchedAt: new Date().toISOString(),
+        })}::jsonb`,
+      })
+      .where(eq(runs.id, runId));
+    const delivery = {
+      runId,
+      orgId,
+      projectId,
+      repoId: repo.id,
+      owner,
+      repoName: repo.name,
+      headBranch: `feature/${suffix}`,
+      expectedHeadSha: "b".repeat(40),
+      baseSha: "a".repeat(40),
+      baseBranch: "main",
+      title: "feat: prove terminal atomicity",
+      body: "Conflict row used to force a rollback after key revocation.",
+      issueNumber: 91,
+    } satisfies typeof runDeliveries.$inferInsert;
+    await db.insert(runDeliveries).values(delivery);
+    const result = {
+      status: "succeeded" as const,
+      git: {
+        changed: true,
+        branch: delivery.headBranch,
+        headSha: delivery.expectedHeadSha,
+        baseSha: delivery.baseSha,
+        pullRequestTitle: delivery.title,
+        pullRequestBody: delivery.body,
+      },
+    };
+    await expect(finishRun(db, staleRun, result)).rejects.toMatchObject({
+      cause: { code: "23505" },
+    });
+    const [rolledBack] = await db.select().from(runs).where(eq(runs.id, runId));
+    expect(rolledBack?.status).toBe("running");
+    expect(readSandbox(rolledBack?.sandbox).ref).toBe(providerRef);
+    expect(
+      (await db.select().from(virtualKeys).where(eq(virtualKeys.id, virtualKeyId)))[0]?.revokedAt,
+    ).toBeNull();
+    expect(
+      (await db.select().from(apiKeys).where(eq(apiKeys.id, platformKeyId)))[0]?.revokedAt,
+    ).toBeNull();
+
+    await db.delete(runDeliveries).where(eq(runDeliveries.runId, runId));
+    const finished = await finishRun(db, staleRun, result);
+    expect(finished.status).toBe("succeeded");
+    const [stored] = await db.select().from(runs).where(eq(runs.id, runId));
+    expect(readSandbox(stored?.sandbox)).toMatchObject({
+      ref: providerRef,
+      finishedAt: expect.any(String),
+    });
+    expect(
+      (await db.select().from(virtualKeys).where(eq(virtualKeys.id, virtualKeyId)))[0]?.revokedAt,
+    ).not.toBeNull();
+    expect(
+      (await db.select().from(apiKeys).where(eq(apiKeys.id, platformKeyId)))[0]?.revokedAt,
+    ).not.toBeNull();
+  });
+
   it("persists the first engine session event before the runner reaches a result", async () => {
     const token = "frt_early_session";
     const run = await insertRunnerRun(token, "running");
@@ -1683,7 +1815,7 @@ describe("sandbox api", async () => {
     let tokenInput: Record<string, unknown> | undefined;
     app.githubInstallationTokenFactory = async (input) => {
       tokenInput = input;
-      return "installation-token";
+      return { token: "installation-token", expiresAt: "2099-01-01T00:00:00.000Z" };
     };
     const previousGithubFactory = app.githubClientFactory;
     app.githubClientFactory = async (actualInstallationId) => {

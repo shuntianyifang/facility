@@ -30,6 +30,7 @@ export const ID_PREFIXES = {
   evt: "evt",
   int: "int",
   fp: "fp",
+  rwl: "rwl",
 } as const;
 
 export type IdPrefix = keyof typeof ID_PREFIXES;

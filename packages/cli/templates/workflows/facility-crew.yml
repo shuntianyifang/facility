@@ -186,7 +186,8 @@ jobs:
       # cannot verify will defer; a provisioned one finishes.
       - name: Provision environment
         if: steps.requested-agent.outputs.run == 'true'
-        run: {{PROVISION_CMD}}
+        run: |
+{{PROVISION_RUN}}
 
       - name: Capture /builder delivery baseline
         id: builder-start

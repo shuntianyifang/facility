@@ -68,6 +68,36 @@ with compose.
 
 5. Start or roll the services in this order: `api`, `worker`, `gateway`, `mcp`,
    then optional `web`.
+
+   Repository-write tracking uses an explicit two-phase promotion during the
+   upgrade that introduces durable write leases:
+
+   1. Deploy the new API and runner everywhere with
+      `FACILITY_REPOSITORY_WRITE_TRACKING_PROMOTION=0` (the default). New
+      runners negotiate version `0` and use the legacy token wire format; those
+      runs remain permanently ineligible for governed retry.
+   2. After every old API replica is drained, set
+      `FACILITY_REPOSITORY_WRITE_TRACKING_PROMOTION=1` on every API replica.
+      New handshakes then negotiate version `1`, and every write token is
+      backed by a durable repository-write lease.
+
+   Once phase 2 has created any version-1 run, do not roll back to an old API
+   binary until all version-1 runs are terminal and drained. The promotion flag
+   controls only new `/hello` negotiation: a new API always enforces an existing
+   version-1 marker even when the flag is off.
+
+   Governed Builder successor retries use a second, independent two-phase gate:
+
+   1. Deploy the migration, API, and worker everywhere with
+      `FACILITY_GOVERNED_BUILDER_RETRY_PROMOTION=0` (the default). Drain every
+      worker that predates immutable retry-lineage validation.
+   2. Set `FACILITY_GOVERNED_BUILDER_RETRY_PROMOTION=1` on every API replica.
+      Only then can `POST /v1/runs/:runId/retry` create successor rows.
+
+   Once any successor row exists, do not reintroduce an old API or worker binary
+   until every successor is terminal and drained. Turning the promotion flag
+   off stops creation only; upgraded workers continue to enforce and dispatch
+   already-created successors.
 6. Bootstrap the first owner and issue an API key. On an empty installation,
    run `facility instance bootstrap`, then open `https://<web-host>/api/auth/login`; the configured GitHub user
    signs into the organization already created by bootstrap. With the optional web

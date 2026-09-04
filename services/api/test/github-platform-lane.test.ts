@@ -29,12 +29,16 @@ import {
   seed,
   userIdentities,
 } from "@facility/db";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import { executeApprovedProposal } from "../src/executors.js";
-import type { GithubClientFactory, Octokit } from "../src/github/client.js";
+import type {
+  GithubClientFactory,
+  GithubInstallationTokenFactory,
+  Octokit,
+} from "../src/github/client.js";
 import { pullRequestBodyForIssue } from "../src/github/closing-issues.js";
 import { githubIssueRevisionSha256 } from "../src/github/issue-revision.js";
 import { syncRepoIssues, upsertGhIssueFromWebhook } from "../src/github/issues-sync.js";
@@ -3831,7 +3835,7 @@ describe("github platform lane", async () => {
       url: `/internal/runs/${run.id}/push-token`,
       headers: { authorization: "Bearer wrong" },
     });
-    expect(wrong.statusCode).toBe(401);
+    expect(wrong.statusCode, JSON.stringify(wrong.json())).toBe(401);
 
     const noInstallation = await app.inject({
       method: "POST",
@@ -3848,6 +3852,335 @@ describe("github platform lane", async () => {
       headers: { authorization: `Bearer ${token}` },
     });
     expect(terminal.statusCode).toBe(409);
+  });
+
+  it("issues exact repository-pinned permissions for the verified delivery capability", async () => {
+    const runnerToken = "frt_push_capability";
+    const repo = await insertRepoWithInstallation(`push-capability-${Date.now()}`);
+    const [installation] = await db
+      .select()
+      .from(githubInstallations)
+      .where(eq(githubInstallations.id, repo.installationId as string));
+    if (!installation) throw new Error("push-token test installation missing");
+    const run = await insertRun({
+      status: "running",
+      sandbox: {
+        runnerTokenHash: await hashKey(runnerToken),
+        bundle: {
+          repo: {
+            cloneUrl: `https://github.com/${repo.owner}/${repo.name}.git`,
+            branch: "main",
+            expectedHeadSha: null,
+            installationTokenRef: null,
+          },
+        },
+      },
+    });
+    const calls: Parameters<GithubInstallationTokenFactory>[0][] = [];
+    app.githubInstallationTokenFactory = async (input) => {
+      calls.push(input);
+      return {
+        token: `issued-token-${calls.length}`,
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      };
+    };
+    const request = (payload?: Record<string, unknown>) =>
+      app.inject({
+        method: "POST",
+        url: `/internal/runs/${run.id}/push-token`,
+        headers: { authorization: `Bearer ${runnerToken}` },
+        ...(payload === undefined ? {} : { payload }),
+      });
+
+    try {
+      const absent = await request();
+      const explicitFalse = await request({ workflowWrite: false });
+      const workflow = await request({ workflowWrite: true });
+
+      expect(absent.statusCode, JSON.stringify(absent.json())).toBe(200);
+      expect(absent.json()).toEqual({ token: "issued-token-1", authorizedBranch: null });
+      expect(explicitFalse.statusCode).toBe(200);
+      expect(explicitFalse.json()).toEqual({ token: "issued-token-2", authorizedBranch: null });
+      expect(workflow.statusCode).toBe(200);
+      expect(workflow.json()).toEqual({ token: "issued-token-3", authorizedBranch: null });
+      expect(calls).toEqual([
+        {
+          installationId: installation.installationId,
+          owner: repo.owner,
+          repo: repo.name,
+          permissions: { contents: "write" },
+        },
+        {
+          installationId: installation.installationId,
+          owner: repo.owner,
+          repo: repo.name,
+          permissions: { contents: "write" },
+        },
+        {
+          installationId: installation.installationId,
+          owner: repo.owner,
+          repo: repo.name,
+          permissions: { contents: "write", workflows: "write" },
+        },
+      ]);
+
+      for (const malformed of [
+        { workflowWrite: "true" },
+        { permissions: { workflows: "write" } },
+        { workflowWrite: true, repo: "foreign/repository" },
+      ]) {
+        const response = await request(malformed);
+        expect(response.statusCode).toBe(400);
+        expect(response.json().error.code).toBe("validation_error");
+      }
+      expect(calls).toHaveLength(3);
+
+      const audit = await db
+        .select()
+        .from(auditEvents)
+        .where(
+          and(
+            eq(auditEvents.action, "run.push_token_issued"),
+            sql`${auditEvents.target}->>'id' = ${run.id}`,
+          ),
+        )
+        .orderBy(asc(auditEvents.createdAt), asc(auditEvents.id));
+      expect(audit.map((event) => event.payload)).toEqual([
+        expect.objectContaining({
+          repoId: repo.id,
+          provider: "github_installation",
+          permissions: ["contents"],
+          repositoryWriteTrackingVersion: 0,
+          issuedAt: expect.any(String),
+          expiresAt: "2099-01-01T00:00:00.000Z",
+        }),
+        expect.objectContaining({
+          repoId: repo.id,
+          provider: "github_installation",
+          permissions: ["contents"],
+          repositoryWriteTrackingVersion: 0,
+          issuedAt: expect.any(String),
+          expiresAt: "2099-01-01T00:00:00.000Z",
+        }),
+        expect.objectContaining({
+          repoId: repo.id,
+          provider: "github_installation",
+          permissions: ["contents", "workflows"],
+          repositoryWriteTrackingVersion: 0,
+          issuedAt: expect.any(String),
+          expiresAt: "2099-01-01T00:00:00.000Z",
+        }),
+      ]);
+      expect(JSON.stringify(audit)).not.toContain("issued-token");
+      expect(JSON.stringify(audit)).not.toContain("foreign/repository");
+    } finally {
+      app.githubInstallationTokenFactory = undefined;
+    }
+  });
+
+  it("refuses push tokens from foreign, suspended, or owner-mismatched installations", async () => {
+    const deniedCases = ["foreign-org", "suspended", "owner-mismatch"] as const;
+    const factoryCalls: Parameters<GithubInstallationTokenFactory>[0][] = [];
+    app.githubInstallationTokenFactory = async (input) => {
+      factoryCalls.push(input);
+      return { token: "must-not-be-issued", expiresAt: "2099-01-01T00:00:00.000Z" };
+    };
+
+    try {
+      for (const deniedCase of deniedCases) {
+        const runnerToken = `frt_push_${deniedCase}`;
+        const owner = `push-${deniedCase}-${newId("repo")}`;
+        const repo = await insertRepoWithInstallation(owner);
+        const [installation] = await db
+          .select()
+          .from(githubInstallations)
+          .where(eq(githubInstallations.id, repo.installationId as string));
+        if (!installation) throw new Error(`push-token ${deniedCase} installation missing`);
+
+        if (deniedCase === "foreign-org") {
+          const foreignOrgId = newId("org");
+          await db.insert(orgs).values({
+            id: foreignOrgId,
+            name: "Foreign push-token tenant",
+            slug: `foreign-push-token-${foreignOrgId}`,
+          });
+          await db
+            .update(githubInstallations)
+            .set({ orgId: foreignOrgId })
+            .where(eq(githubInstallations.id, installation.id));
+        } else if (deniedCase === "suspended") {
+          await db
+            .update(githubInstallations)
+            .set({ suspendedAt: new Date("2026-09-01T00:00:00.000Z") })
+            .where(eq(githubInstallations.id, installation.id));
+        } else {
+          await db
+            .update(githubInstallations)
+            .set({ accountLogin: `${owner}-different` })
+            .where(eq(githubInstallations.id, installation.id));
+        }
+
+        const run = await insertRun({
+          status: "running",
+          sandbox: {
+            runnerTokenHash: await hashKey(runnerToken),
+            bundle: {
+              repo: {
+                cloneUrl: `https://github.com/${repo.owner}/${repo.name}.git`,
+                branch: "main",
+                expectedHeadSha: null,
+                installationTokenRef: null,
+              },
+            },
+          },
+        });
+        const response = await app.inject({
+          method: "POST",
+          url: `/internal/runs/${run.id}/push-token`,
+          headers: { authorization: `Bearer ${runnerToken}` },
+          payload: { workflowWrite: true },
+        });
+
+        expect(response.statusCode, `${deniedCase}: ${JSON.stringify(response.json())}`).toBe(409);
+        expect(response.json()).toEqual({
+          error: {
+            code: "no_installation",
+            message: "Run repository has no GitHub installation",
+          },
+        });
+        const audit = await db
+          .select()
+          .from(auditEvents)
+          .where(
+            and(
+              eq(auditEvents.action, "run.push_token_issued"),
+              sql`${auditEvents.target}->>'id' = ${run.id}`,
+            ),
+          );
+        expect(audit).toHaveLength(0);
+      }
+
+      expect(factoryCalls).toHaveLength(0);
+    } finally {
+      app.githubInstallationTokenFactory = undefined;
+    }
+  });
+
+  it("accepts installation owner casing with GitHub's case-insensitive semantics", async () => {
+    const runnerToken = "frt_push_owner_casing";
+    const owner = `push-owner-casing-${newId("repo")}`;
+    const repo = await insertRepoWithInstallation(owner);
+    const [installation] = await db
+      .select()
+      .from(githubInstallations)
+      .where(eq(githubInstallations.id, repo.installationId as string));
+    if (!installation) throw new Error("push-token owner-casing installation missing");
+    await db
+      .update(githubInstallations)
+      .set({ accountLogin: owner.toUpperCase() })
+      .where(eq(githubInstallations.id, installation.id));
+    const run = await insertRun({
+      status: "running",
+      sandbox: {
+        runnerTokenHash: await hashKey(runnerToken),
+        bundle: {
+          repo: {
+            cloneUrl: `https://github.com/${repo.owner}/${repo.name}.git`,
+            branch: "main",
+            expectedHeadSha: null,
+            installationTokenRef: null,
+          },
+        },
+      },
+    });
+    const factoryCalls: Parameters<GithubInstallationTokenFactory>[0][] = [];
+    app.githubInstallationTokenFactory = async (input) => {
+      factoryCalls.push(input);
+      return {
+        token: "issued-for-case-equivalent-owner",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      };
+    };
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: `/internal/runs/${run.id}/push-token`,
+        headers: { authorization: `Bearer ${runnerToken}` },
+        payload: { workflowWrite: false },
+      });
+
+      expect(response.statusCode, JSON.stringify(response.json())).toBe(200);
+      expect(response.json()).toEqual({
+        token: "issued-for-case-equivalent-owner",
+        authorizedBranch: null,
+      });
+      expect(factoryCalls).toEqual([
+        {
+          installationId: installation.installationId,
+          owner: repo.owner,
+          repo: repo.name,
+          permissions: { contents: "write" },
+        },
+      ]);
+    } finally {
+      app.githubInstallationTokenFactory = undefined;
+    }
+  });
+
+  it("fails closed when GitHub refuses the elevated workflow permission", async () => {
+    const runnerToken = "frt_push_workflow_denied";
+    const repo = await insertRepoWithInstallation(`push-denied-${Date.now()}`);
+    const run = await insertRun({
+      status: "running",
+      sandbox: {
+        runnerTokenHash: await hashKey(runnerToken),
+        bundle: {
+          repo: {
+            cloneUrl: `https://github.com/${repo.owner}/${repo.name}.git`,
+            branch: "main",
+            expectedHeadSha: null,
+            installationTokenRef: null,
+          },
+        },
+      },
+    });
+    const calls: Parameters<GithubInstallationTokenFactory>[0][] = [];
+    app.githubInstallationTokenFactory = async (input) => {
+      calls.push(input);
+      throw new Error("installation lacks workflow permission");
+    };
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: `/internal/runs/${run.id}/push-token`,
+        headers: { authorization: `Bearer ${runnerToken}` },
+        payload: { workflowWrite: true },
+      });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        error: {
+          code: "repository_write_credential_indeterminate",
+          message: "Repository write credential issuance is indeterminate",
+        },
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.permissions).toEqual({ contents: "write", workflows: "write" });
+      const audit = await db
+        .select()
+        .from(auditEvents)
+        .where(
+          and(
+            eq(auditEvents.action, "run.push_token_issued"),
+            sql`${auditEvents.target}->>'id' = ${run.id}`,
+          ),
+        );
+      expect(audit).toHaveLength(0);
+    } finally {
+      app.githubInstallationTokenFactory = undefined;
+    }
   });
 
   it("finishRun opens a PR and records the producing outcome", async () => {

@@ -54,7 +54,7 @@ For an existing-repository lifecycle, set these **Repository permissions**:
 | Metadata | Read-only | repository identity and collaborator metadata; GitHub normally selects this automatically |
 | Pull requests | Read and write | open and close PRs and collect review evidence |
 | Secret scanning alerts | Read-only | collect deterministic platform security-sweep evidence when secret scanning is enabled |
-| Workflows | Read and write | install or update files under `.github/workflows` during kickstart |
+| Workflows | Read and write | install or update files under `.github/workflows` during kickstart or governed delivery |
 
 Set **Organization permissions → Members** and **Account permissions → Email
 addresses** to **Read-only**. The latter is required for direct GitHub sign-in;
@@ -73,6 +73,21 @@ particular, `workflow_run` requires Actions read access, `check_run` requires
 Checks read access, and `deployment_status` requires Deployments read access.
 Facility records a scanner as unavailable rather than clean when its GitHub
 feature is disabled or its read permission has not been approved.
+
+Facility still mints repository-pinned installation tokens with the smallest
+permission set needed by each governed delivery. A final diff without files
+below `.github/workflows/` receives only `Contents: Read and write`. After the
+runner validates the final paths and determines that a workflow file is present,
+the token receives exactly `Contents: Read and write` and `Workflows: Read and
+write`. The runner sends a closed boolean capability, not an arbitrary permission
+map, and the agent never receives the runner credential used to request it.
+
+The App and its installation must nevertheless have `Workflows: Read and write`
+available for that conditional token. If they do not, workflow delivery fails
+closed rather than falling back to a contents-only or broadly inherited token.
+Changing this permission on an already installed App may require an organization
+owner to approve the updated installation permissions before retrying delivery.
+
 See GitHub's
 [permission guide](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app)
 and [webhook event reference](https://docs.github.com/en/webhooks/webhook-events-and-payloads).

@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { newId, sealFacilityReceipt } from "@facility/core";
+import { generateApiKey, newId, sealFacilityReceipt } from "@facility/core";
 import {
   actionTypes,
   agentDefs,
+  apiKeys,
   auditEvents,
   createDb,
   type FacilityDb,
@@ -13,13 +14,20 @@ import {
   proposalEvents,
   proposals,
   registryItems,
+  registryVersions,
   repos,
+  roles,
+  runEvents,
+  runRepositoryWriteLeases,
   runs,
+  sandboxProfiles,
+  virtualKeys,
 } from "@facility/db";
 import { and, desc, eq } from "drizzle-orm";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resolveBuilderPlanFreshnessForProposal } from "../src/builder-plan-freshness.js";
+import { buildApp } from "../src/app.js";
 import {
   assertBuilderPlanDispatch,
   lockBuilderPlanPolicy,
@@ -29,6 +37,11 @@ import { ApiError } from "../src/errors.js";
 import { githubIssueRevisionSha256 } from "../src/github/issue-revision.js";
 import { syncRepoFacilityConfig } from "../src/github/kickstart.js";
 import { routeTrigger, type TriggerPayload } from "../src/github/router.js";
+import {
+  createGovernedBuilderRetry,
+  validateGovernedRetryForDispatch,
+} from "../src/governed-builder-retry.js";
+import type { SandboxDriver } from "../src/sandbox/driver.js";
 import { dispatchRun } from "../src/sandbox/orchestrator.js";
 import type { AppConfig } from "../src/types.js";
 
@@ -710,6 +723,967 @@ describe("builder plan policy integration", async () => {
     ).toEqual({ status: "failed", error: expected });
     await expect(lastDenialCode(fixture.orgId)).resolves.toBe(expected);
   });
+
+  it("creates one clean governed successor under concurrent retry requests and revalidates it for dispatch", async () => {
+    const fixture = await githubRouteFixture("open");
+    await db
+      .update(projects)
+      .set({ builderPlanPolicy: "required" })
+      .where(eq(projects.id, fixture.projectId));
+    await db
+      .update(repos)
+      .set({
+        fingerprint: { files: [] },
+        fingerprintStatus: "ok",
+        fingerprintVerifiedAt: new Date(),
+      })
+      .where(eq(repos.projectId, fixture.projectId));
+    const routed = await routeTrigger(db, fixture.orgId, fixture.client, fixture.payload);
+    if (!routed.runId) throw new Error("governed retry root was not created");
+    await db.update(runs).set({ status: "provisioning" }).where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "running", repositoryWriteTrackingVersion: 1 })
+      .where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "failed", endedAt: new Date() })
+      .where(eq(runs.id, routed.runId));
+
+    const repository = fixture.payload.repository;
+    const owner = repository?.owner?.login;
+    const repo = repository?.name;
+    if (!owner || !repo) throw new Error("governed retry repository fixture missing");
+    const options = { githubClient: { owner, repo, client: fixture.client } };
+    const attempts = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        createGovernedBuilderRetry(
+          db,
+          db,
+          {
+            orgId: fixture.orgId,
+            projectId: fixture.projectId,
+            parentRunId: routed.runId as string,
+            actor: { type: "user", id: "approver" },
+            reason: "Retry the failed tracked Builder",
+          },
+          options,
+        ),
+      ),
+    );
+    expect(new Set(attempts.map((attempt) => attempt.run.id)).size).toBe(1);
+    expect(attempts.filter((attempt) => attempt.created)).toHaveLength(1);
+    const child = attempts[0]?.run;
+    if (!child) throw new Error("governed retry child missing");
+    expect(child).toMatchObject({
+      retryOfRunId: routed.runId,
+      status: "queued",
+      sandbox: {},
+      receipt: null,
+      engineSessionId: null,
+      transcriptUri: null,
+      sessionStateUri: null,
+      gh: { owner, repo, issueNumber: 204 },
+    });
+    expect(await db.select().from(runEvents).where(eq(runEvents.runId, child.id))).toEqual([
+      expect.objectContaining({ seq: 1, type: "queued" }),
+    ]);
+    const retryAudits = await db
+      .select()
+      .from(auditEvents)
+      .where(and(eq(auditEvents.orgId, fixture.orgId), eq(auditEvents.action, "run.retried")));
+    expect(
+      retryAudits.filter((event) => (event.target as { id?: unknown }).id === child.id),
+    ).toHaveLength(1);
+
+    const dispatchValidation = await validateGovernedRetryForDispatch(db, child, options);
+    expect(dispatchValidation.lineage).toMatchObject({
+      parent: { id: routed.runId, status: "failed" },
+      root: { id: routed.runId },
+      depth: 1,
+    });
+    await db
+      .update(runs)
+      .set({ gh: { owner, repo, issueNumber: 204, branch: "forged/output" } })
+      .where(eq(runs.id, child.id));
+    const forged = (await db.select().from(runs).where(eq(runs.id, child.id)).limit(1))[0];
+    if (!forged) throw new Error("forged governed retry child missing");
+    await expect(validateGovernedRetryForDispatch(db, forged, options)).rejects.toMatchObject({
+      code: "governed_retry_lineage_invalid",
+      details: { reason: "successor_not_clean" },
+    });
+    await db
+      .update(runs)
+      .set({ gh: { owner, repo, issueNumber: 204 } })
+      .where(eq(runs.id, child.id));
+
+    const retryConfig: AppConfig = {
+      databaseUrl,
+      secretMasterKey: Buffer.alloc(32, 7).toString("base64"),
+      port: 0,
+      publicUrl: "http://127.0.0.1:4400",
+      webUrl: "http://127.0.0.1:4400",
+      sandboxApiUrl: "http://127.0.0.1:4400",
+      sandboxGatewayUrl: "http://127.0.0.1:4410",
+      gatewayUrl: "http://127.0.0.1:4410",
+      sandboxRunnerImage: "facility-runner:test",
+      sandboxDriver: "docker",
+      facilityInsecureDev: true,
+      packageRegistryToken: "package-token",
+      governedBuilderRetryPromotionEnabled: true,
+      logLevel: "silent",
+    };
+    const roleId = newId("role");
+    await db.insert(roles).values({
+      id: roleId,
+      orgId: fixture.orgId,
+      name: `governed-retry-${crypto.randomUUID()}`,
+      permissions: ["runs:trigger"],
+    });
+    const retryKey = await generateApiKey("fak");
+    await db.insert(apiKeys).values({
+      id: retryKey.id,
+      orgId: fixture.orgId,
+      name: "governed retry integration",
+      prefix: retryKey.lookup,
+      last4: retryKey.last4,
+      hash: retryKey.hash,
+      scopeType: "project",
+      projectId: fixture.projectId,
+      roleId,
+      createdBy: "integration-test",
+    });
+    const foreignOrgId = newId("org");
+    const foreignProjectId = newId("proj");
+    const foreignRoleId = newId("role");
+    await db.insert(orgs).values({
+      id: foreignOrgId,
+      name: "Foreign retry tenant",
+      slug: `foreign-retry-${crypto.randomUUID()}`,
+    });
+    await db.insert(projects).values({
+      id: foreignProjectId,
+      orgId: foreignOrgId,
+      name: "Foreign retry project",
+      slug: `foreign-retry-${crypto.randomUUID()}`,
+    });
+    await db.insert(roles).values({
+      id: foreignRoleId,
+      orgId: foreignOrgId,
+      name: `foreign-retry-${crypto.randomUUID()}`,
+      permissions: ["runs:trigger"],
+    });
+    const foreignKey = await generateApiKey("fak");
+    await db.insert(apiKeys).values({
+      id: foreignKey.id,
+      orgId: foreignOrgId,
+      name: "foreign governed retry integration",
+      prefix: foreignKey.lookup,
+      last4: foreignKey.last4,
+      hash: foreignKey.hash,
+      scopeType: "project",
+      projectId: foreignProjectId,
+      roleId: foreignRoleId,
+      createdBy: "integration-test",
+    });
+    const app = await buildApp(retryConfig);
+    let enqueueAttempts = 0;
+    app.enqueue = async () => {
+      enqueueAttempts += 1;
+      if (enqueueAttempts === 1) throw new Error("simulated_broker_outage");
+      return `job_${enqueueAttempts}`;
+    };
+    await app.ready();
+    try {
+      const crossTenant = await app.inject({
+        method: "POST",
+        url: `/v1/runs/${routed.runId}/retry`,
+        headers: {
+          authorization: `Bearer ${foreignKey.secret}`,
+          "idempotency-key": `governed-retry-foreign-${crypto.randomUUID()}`,
+        },
+      });
+      expect(crossTenant.statusCode).toBe(404);
+      expect(crossTenant.json().error.code).toBe("run_not_found");
+      expect(enqueueAttempts).toBe(0);
+      const idempotencyKey = `governed-retry-adopt-${crypto.randomUUID()}`;
+      const failedEnqueue = await app.inject({
+        method: "POST",
+        url: `/v1/runs/${routed.runId}/retry`,
+        headers: {
+          authorization: `Bearer ${retryKey.secret}`,
+          "idempotency-key": idempotencyKey,
+        },
+      });
+      expect(failedEnqueue.statusCode).toBe(500);
+      const adopted = await app.inject({
+        method: "POST",
+        url: `/v1/runs/${routed.runId}/retry`,
+        headers: {
+          authorization: `Bearer ${retryKey.secret}`,
+          "idempotency-key": idempotencyKey,
+        },
+      });
+      expect(adopted.statusCode, adopted.body).toBe(200);
+      expect(adopted.json()).toMatchObject({ id: child.id, retryOfRunId: routed.runId });
+      expect(enqueueAttempts).toBe(2);
+      expect(
+        await db
+          .select({ id: runs.id })
+          .from(runs)
+          .where(eq(runs.retryOfRunId, routed.runId as string)),
+      ).toHaveLength(1);
+    } finally {
+      await app.close();
+    }
+
+    const builderAgent = (
+      await db
+        .select()
+        .from(agentDefs)
+        .where(eq(agentDefs.id, child.agentDefId ?? ""))
+        .limit(1)
+    )[0];
+    if (!builderAgent) throw new Error("governed retry Builder agent missing");
+    const profileId = newId("sbx");
+    await db.insert(sandboxProfiles).values({
+      id: profileId,
+      orgId: fixture.orgId,
+      projectId: fixture.projectId,
+      name: "Governed retry integration",
+      driver: "docker",
+      image: "facility-runner:test",
+      setup: {},
+      resources: {},
+      network: {},
+    });
+    await db
+      .update(agentDefs)
+      .set({ sandboxProfileId: profileId })
+      .where(eq(agentDefs.id, builderAgent.id));
+    await db.insert(registryVersions).values({
+      id: newId("ver"),
+      orgId: fixture.orgId,
+      itemId: builderAgent.contractItemId,
+      version: 1,
+      content: "Implement only the approved plan.",
+      contentHash: createHash("sha256").update("Implement only the approved plan.").digest("hex"),
+      status: "active",
+      createdBy: "integration-test",
+    });
+    let launches = 0;
+    const driver: SandboxDriver = {
+      name: "docker",
+      launch: async () => {
+        launches += 1;
+        return { ref: `governed-retry-${launches}` };
+      },
+      status: async () => "running",
+      async *logs() {},
+      stop: async () => undefined,
+      destroy: async () => undefined,
+    };
+    await Promise.all([
+      dispatchRun(
+        retryConfig,
+        { runId: child.id, orgId: fixture.orgId },
+        {
+          githubClient: options.githubClient,
+          sandboxDriver: async () => driver,
+        },
+      ),
+      dispatchRun(
+        retryConfig,
+        { runId: child.id, orgId: fixture.orgId },
+        {
+          githubClient: options.githubClient,
+          sandboxDriver: async () => driver,
+        },
+      ),
+    ]);
+    expect(launches).toBe(1);
+    expect(
+      await db
+        .select({ id: virtualKeys.id })
+        .from(virtualKeys)
+        .where(eq(virtualKeys.runId, child.id)),
+    ).toHaveLength(1);
+    expect(
+      await db.select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.runId, child.id)),
+    ).toHaveLength(1);
+    expect(
+      (
+        await db
+          .select({ status: runs.status, sandbox: runs.sandbox })
+          .from(runs)
+          .where(eq(runs.id, child.id))
+          .limit(1)
+      )[0],
+    ).toMatchObject({ status: "provisioning", sandbox: { ref: "governed-retry-1" } });
+  });
+
+  it("fails a governed retry worker on post-creation drift before credentials or sandbox launch", async () => {
+    const fixture = await githubRouteFixture("open");
+    await db
+      .update(projects)
+      .set({ builderPlanPolicy: "required" })
+      .where(eq(projects.id, fixture.projectId));
+    await db
+      .update(repos)
+      .set({
+        fingerprint: { files: [] },
+        fingerprintStatus: "ok",
+        fingerprintVerifiedAt: new Date(),
+      })
+      .where(eq(repos.projectId, fixture.projectId));
+    const routed = await routeTrigger(db, fixture.orgId, fixture.client, fixture.payload);
+    if (!routed.runId) throw new Error("governed retry drift root was not created");
+    await db.update(runs).set({ status: "provisioning" }).where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "running", repositoryWriteTrackingVersion: 1 })
+      .where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "failed", endedAt: new Date() })
+      .where(eq(runs.id, routed.runId));
+    const owner = fixture.payload.repository?.owner?.login;
+    const repo = fixture.payload.repository?.name;
+    if (!owner || !repo) throw new Error("governed retry drift repository missing");
+    const child = (
+      await createGovernedBuilderRetry(
+        db,
+        db,
+        {
+          orgId: fixture.orgId,
+          projectId: fixture.projectId,
+          parentRunId: routed.runId,
+          actor: { type: "user", id: "approver" },
+        },
+        { githubClient: { owner, repo, client: fixture.client } },
+      )
+    ).run;
+    await db
+      .update(repos)
+      .set({ fingerprintStatus: "drifted", fingerprintVerifiedAt: new Date() })
+      .where(eq(repos.projectId, fixture.projectId));
+
+    let launches = 0;
+    const driver: SandboxDriver = {
+      name: "docker",
+      launch: async () => {
+        launches += 1;
+        return { ref: "must-not-launch" };
+      },
+      status: async () => "running",
+      async *logs() {},
+      stop: async () => undefined,
+      destroy: async () => undefined,
+    };
+    await expect(
+      dispatchRun(
+        { databaseUrl } as AppConfig,
+        { runId: child.id, orgId: fixture.orgId },
+        {
+          githubClient: { owner, repo, client: fixture.client },
+          sandboxDriver: async () => driver,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "governed_retry_lane_invalid",
+      details: { reason: "repository_fingerprint_unverified" },
+    });
+    expect(launches).toBe(0);
+    expect(
+      await db
+        .select({ id: virtualKeys.id })
+        .from(virtualKeys)
+        .where(eq(virtualKeys.runId, child.id)),
+    ).toHaveLength(0);
+    expect(
+      await db.select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.runId, child.id)),
+    ).toHaveLength(0);
+    expect(
+      (
+        await db
+          .select({ status: runs.status, error: runs.error, sandbox: runs.sandbox })
+          .from(runs)
+          .where(eq(runs.id, child.id))
+          .limit(1)
+      )[0],
+    ).toEqual({
+      status: "failed",
+      error: "governed_retry_lane_invalid:repository_fingerprint_unverified",
+      sandbox: {},
+    });
+    const denials = await db
+      .select({ target: auditEvents.target, payload: auditEvents.payload })
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.orgId, fixture.orgId),
+          eq(auditEvents.action, "run.governed_retry_denied"),
+        ),
+      );
+    expect(denials.filter((event) => (event.target as { id?: unknown }).id === child.id)).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          code: "governed_retry_lane_invalid",
+          reason: "repository_fingerprint_unverified",
+          source: "worker_claimed_governed_retry",
+        }),
+      }),
+    ]);
+  });
+
+  it("rejects a forged successor of a legacy tracking-zero run before GitHub or launch", async () => {
+    const fixture = await githubRouteFixture("open");
+    await db
+      .update(projects)
+      .set({ builderPlanPolicy: "required" })
+      .where(eq(projects.id, fixture.projectId));
+    await db
+      .update(repos)
+      .set({
+        fingerprint: { files: [] },
+        fingerprintStatus: "ok",
+        fingerprintVerifiedAt: new Date(),
+      })
+      .where(eq(repos.projectId, fixture.projectId));
+    const routed = await routeTrigger(db, fixture.orgId, fixture.client, fixture.payload);
+    if (!routed.runId) throw new Error("legacy governed retry root was not created");
+    await db
+      .update(runs)
+      .set({ status: "failed", endedAt: new Date() })
+      .where(eq(runs.id, routed.runId));
+    const parent = (await db.select().from(runs).where(eq(runs.id, routed.runId)).limit(1))[0];
+    const repository = (
+      await db.select().from(repos).where(eq(repos.projectId, fixture.projectId)).limit(1)
+    )[0];
+    if (!parent || !repository) throw new Error("legacy governed retry fixture missing");
+    await db.insert(runRepositoryWriteLeases).values({
+      id: newId("rwl"),
+      orgId: fixture.orgId,
+      projectId: fixture.projectId,
+      runId: parent.id,
+      repoId: repository.id,
+      provider: "github_installation",
+      status: "issued",
+      requestedBranch: "facility/legacy-fabricated",
+      authorizedBranch: "facility/legacy-fabricated",
+      baseSha: String(
+        (parent.trigger as { planProvenance?: { workspaceBaseSha?: unknown } }).planProvenance
+          ?.workspaceBaseSha,
+      ),
+      permissions: ["contents"],
+      issuedAt: new Date(Date.now() - 60 * 60_000),
+      expiresAt: new Date(Date.now() - 30 * 60_000),
+    });
+    const child = (
+      await db
+        .insert(runs)
+        .values({
+          id: newId("run"),
+          orgId: parent.orgId,
+          projectId: parent.projectId,
+          retryOfRunId: parent.id,
+          agentDefId: parent.agentDefId,
+          mode: parent.mode,
+          engine: parent.engine,
+          trigger: parent.trigger,
+          gh: { owner: repository.owner, repo: repository.name, issueNumber: 204 },
+          createdBy: { type: "user", id: "forged-legacy-test" },
+        })
+        .returning()
+    )[0];
+    if (!child) throw new Error("forged legacy child missing");
+    let githubCalls = 0;
+    let launches = 0;
+    const githubClient = {
+      getDefaultBranchSha: async () => {
+        githubCalls += 1;
+        throw new Error("legacy retry reached GitHub");
+      },
+      getIssue: async () => {
+        githubCalls += 1;
+        throw new Error("legacy retry reached GitHub");
+      },
+      listIssueComments: async () => {
+        githubCalls += 1;
+        throw new Error("legacy retry reached GitHub");
+      },
+    } as never;
+    const driver: SandboxDriver = {
+      name: "docker",
+      launch: async () => {
+        launches += 1;
+        return { ref: "must-not-launch" };
+      },
+      status: async () => "running",
+      async *logs() {},
+      stop: async () => undefined,
+      destroy: async () => undefined,
+    };
+    await expect(
+      dispatchRun(
+        { databaseUrl } as AppConfig,
+        { runId: child.id, orgId: child.orgId },
+        {
+          githubClient: { owner: repository.owner, repo: repository.name, client: githubClient },
+          sandboxDriver: async () => driver,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "governed_retry_requires_fresh_gate1",
+      details: {
+        reason: "legacy_repository_write_tracking_unavailable",
+        requiredAction: "run_architect_and_approve_new_plan",
+      },
+    });
+    expect(githubCalls).toBe(0);
+    expect(launches).toBe(0);
+    expect(
+      await db
+        .select({ id: virtualKeys.id })
+        .from(virtualKeys)
+        .where(eq(virtualKeys.runId, child.id)),
+    ).toHaveLength(0);
+    expect(
+      await db.select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.runId, child.id)),
+    ).toHaveLength(0);
+  });
+
+  it("revalidates repository output across every retry ancestor before worker credentials", async () => {
+    const fixture = await githubRouteFixture("open");
+    await db
+      .update(projects)
+      .set({ builderPlanPolicy: "required" })
+      .where(eq(projects.id, fixture.projectId));
+    await db
+      .update(repos)
+      .set({
+        fingerprint: { files: [] },
+        fingerprintStatus: "ok",
+        fingerprintVerifiedAt: new Date(),
+      })
+      .where(eq(repos.projectId, fixture.projectId));
+    const routed = await routeTrigger(db, fixture.orgId, fixture.client, fixture.payload);
+    if (!routed.runId) throw new Error("ancestor evidence root was not created");
+    await db.update(runs).set({ status: "provisioning" }).where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "running", repositoryWriteTrackingVersion: 1 })
+      .where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "failed", endedAt: new Date() })
+      .where(eq(runs.id, routed.runId));
+    const repository = (
+      await db.select().from(repos).where(eq(repos.projectId, fixture.projectId)).limit(1)
+    )[0];
+    const owner = fixture.payload.repository?.owner?.login;
+    const repo = fixture.payload.repository?.name;
+    if (!repository || !owner || !repo) throw new Error("ancestor evidence repository missing");
+    const baseSha = fixture.live.baseSha;
+    const authorizedBranch = `facility/ancestor-${crypto.randomUUID()}`;
+    await db.insert(runRepositoryWriteLeases).values({
+      id: newId("rwl"),
+      orgId: fixture.orgId,
+      projectId: fixture.projectId,
+      runId: routed.runId,
+      repoId: repository.id,
+      provider: "github_installation",
+      status: "issued",
+      requestedBranch: authorizedBranch,
+      authorizedBranch,
+      baseSha,
+      permissions: ["contents"],
+      issuedAt: new Date(Date.now() - 2 * 60 * 60_000),
+      expiresAt: new Date(Date.now() - 60 * 60_000),
+    });
+    let remoteHead = baseSha;
+    const repositoryWriteClient = {
+      repoId: repository.id,
+      client: {
+        assertRepositoryAccessible: async () => undefined,
+        getRef: async () => remoteHead,
+        listPullRequestsForHead: async () => ({ pullRequests: [], hasNextPage: false }),
+      },
+    };
+    const options = {
+      githubClient: { owner, repo, client: fixture.client },
+      repositoryWriteClient,
+    };
+    const firstChild = (
+      await createGovernedBuilderRetry(
+        db,
+        db,
+        {
+          orgId: fixture.orgId,
+          projectId: fixture.projectId,
+          parentRunId: routed.runId,
+          actor: { type: "user", id: "approver" },
+        },
+        options,
+      )
+    ).run;
+    await db.update(runs).set({ status: "provisioning" }).where(eq(runs.id, firstChild.id));
+    await db
+      .update(runs)
+      .set({ status: "running", repositoryWriteTrackingVersion: 1 })
+      .where(eq(runs.id, firstChild.id));
+    await db
+      .update(runs)
+      .set({ status: "failed", endedAt: new Date() })
+      .where(eq(runs.id, firstChild.id));
+    const grandchild = (
+      await createGovernedBuilderRetry(
+        db,
+        db,
+        {
+          orgId: fixture.orgId,
+          projectId: fixture.projectId,
+          parentRunId: firstChild.id,
+          actor: { type: "user", id: "approver" },
+        },
+        options,
+      )
+    ).run;
+
+    remoteHead = "b".repeat(40);
+    let launches = 0;
+    const driver: SandboxDriver = {
+      name: "docker",
+      launch: async () => {
+        launches += 1;
+        return { ref: "must-not-launch" };
+      },
+      status: async () => "running",
+      async *logs() {},
+      stop: async () => undefined,
+      destroy: async () => undefined,
+    };
+    await expect(
+      dispatchRun(
+        { databaseUrl } as AppConfig,
+        { runId: grandchild.id, orgId: fixture.orgId },
+        {
+          githubClient: options.githubClient,
+          repositoryWriteClient,
+          sandboxDriver: async () => driver,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "governed_retry_durable_output",
+      details: { reason: "remote_branch_or_pull_request_exists" },
+    });
+    expect(launches).toBe(0);
+    expect(
+      await db
+        .select({ id: virtualKeys.id })
+        .from(virtualKeys)
+        .where(eq(virtualKeys.runId, grandchild.id)),
+    ).toHaveLength(0);
+    expect(
+      await db.select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.runId, grandchild.id)),
+    ).toHaveLength(0);
+    expect(
+      (
+        await db
+          .select({ status: runs.status, error: runs.error, sandbox: runs.sandbox })
+          .from(runs)
+          .where(eq(runs.id, grandchild.id))
+          .limit(1)
+      )[0],
+    ).toEqual({
+      status: "failed",
+      error: "governed_retry_durable_output:remote_branch_or_pull_request_exists",
+      sandbox: {},
+    });
+    const denial = (
+      await db
+        .select({ payload: auditEvents.payload })
+        .from(auditEvents)
+        .where(
+          and(
+            eq(auditEvents.orgId, fixture.orgId),
+            eq(auditEvents.action, "run.governed_retry_denied"),
+          ),
+        )
+        .orderBy(desc(auditEvents.seq))
+        .limit(1)
+    )[0];
+    expect(denial?.payload).toMatchObject({
+      code: "governed_retry_durable_output",
+      reason: "remote_branch_or_pull_request_exists",
+      source: "worker_initial_governed_retry",
+    });
+  });
+
+  it("denies a parallel governed retry when a legacy resume descendant already exists", async () => {
+    const fixture = await githubRouteFixture("open");
+    await db
+      .update(projects)
+      .set({ builderPlanPolicy: "required" })
+      .where(eq(projects.id, fixture.projectId));
+    await db
+      .update(repos)
+      .set({
+        fingerprint: { files: [] },
+        fingerprintStatus: "ok",
+        fingerprintVerifiedAt: new Date(),
+      })
+      .where(eq(repos.projectId, fixture.projectId));
+    const routed = await routeTrigger(db, fixture.orgId, fixture.client, fixture.payload);
+    if (!routed.runId) throw new Error("legacy descendant root was not created");
+    await db.update(runs).set({ status: "provisioning" }).where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "running", repositoryWriteTrackingVersion: 1 })
+      .where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "failed", endedAt: new Date() })
+      .where(eq(runs.id, routed.runId));
+    const parent = (await db.select().from(runs).where(eq(runs.id, routed.runId)).limit(1))[0];
+    if (!parent) throw new Error("legacy descendant parent missing");
+    await db.insert(runs).values({
+      id: newId("run"),
+      orgId: parent.orgId,
+      projectId: parent.projectId,
+      agentDefId: parent.agentDefId,
+      mode: parent.mode,
+      engine: parent.engine,
+      status: "succeeded",
+      trigger: { type: "resume", resumeOf: parent.id },
+      gh: {
+        owner: fixture.payload.repository?.owner?.login,
+        repo: fixture.payload.repository?.name,
+        issueNumber: 204,
+        branch: "facility/legacy-resume",
+        pr: { number: 991 },
+      },
+      createdBy: { type: "user", id: "legacy-resume-user" },
+      endedAt: new Date(),
+    });
+    const owner = fixture.payload.repository?.owner?.login;
+    const repo = fixture.payload.repository?.name;
+    if (!owner || !repo) throw new Error("legacy descendant repository missing");
+    let githubCalls = 0;
+    const noNetworkClient = {
+      getDefaultBranchSha: async () => {
+        githubCalls += 1;
+        return fixture.live.baseSha;
+      },
+      getIssue: async () => {
+        githubCalls += 1;
+        return null;
+      },
+      listIssueComments: async () => {
+        githubCalls += 1;
+        return [];
+      },
+    } as never;
+
+    await expect(
+      createGovernedBuilderRetry(
+        db,
+        db,
+        {
+          orgId: fixture.orgId,
+          projectId: fixture.projectId,
+          parentRunId: parent.id,
+          actor: { type: "user", id: "approver" },
+        },
+        { githubClient: { owner, repo, client: noNetworkClient } },
+      ),
+    ).rejects.toMatchObject({
+      code: "governed_retry_durable_output",
+      details: { reason: "legacy_resume_descendant_exists" },
+    });
+    expect(githubCalls).toBe(0);
+    expect(
+      await db.select({ id: runs.id }).from(runs).where(eq(runs.retryOfRunId, parent.id)),
+    ).toHaveLength(0);
+  });
+
+  it("persists one sanitized Gate 1 denial after the retry transaction rolls back", async () => {
+    const fixture = await githubRouteFixture("open");
+    await db
+      .update(projects)
+      .set({ builderPlanPolicy: "required" })
+      .where(eq(projects.id, fixture.projectId));
+    await db
+      .update(repos)
+      .set({
+        fingerprint: { files: [] },
+        fingerprintStatus: "ok",
+        fingerprintVerifiedAt: new Date(),
+      })
+      .where(eq(repos.projectId, fixture.projectId));
+    const routed = await routeTrigger(db, fixture.orgId, fixture.client, fixture.payload);
+    if (!routed.runId) throw new Error("stale retry root was not created");
+    await db.update(runs).set({ status: "provisioning" }).where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "running", repositoryWriteTrackingVersion: 1 })
+      .where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "failed", endedAt: new Date() })
+      .where(eq(runs.id, routed.runId));
+    fixture.live.issueBody = "The issue changed after the approved plan";
+    const owner = fixture.payload.repository?.owner?.login;
+    const repo = fixture.payload.repository?.name;
+    if (!owner || !repo) throw new Error("stale retry repository missing");
+
+    await expect(
+      createGovernedBuilderRetry(
+        db,
+        db,
+        {
+          orgId: fixture.orgId,
+          projectId: fixture.projectId,
+          parentRunId: routed.runId,
+          actor: { type: "user", id: "approver" },
+        },
+        { githubClient: { owner, repo, client: fixture.client } },
+      ),
+    ).rejects.toMatchObject({ code: "builder_plan_stale" });
+    expect(
+      await db.select({ id: runs.id }).from(runs).where(eq(runs.retryOfRunId, routed.runId)),
+    ).toHaveLength(0);
+    const denials = await db
+      .select({ target: auditEvents.target, payload: auditEvents.payload })
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.orgId, fixture.orgId),
+          eq(auditEvents.action, "run.builder_plan_denied"),
+        ),
+      );
+    expect(
+      denials.filter((event) => (event.target as { id?: unknown }).id === routed.runId),
+    ).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          code: "builder_plan_stale",
+          reason: "base_or_issue_revision_changed",
+          source: "governed_retry_admission",
+        }),
+      }),
+    ]);
+  });
+
+  it("allows the bounded lineage depth and rejects the next successor before GitHub", async () => {
+    const fixture = await githubRouteFixture("open");
+    await db
+      .update(projects)
+      .set({ builderPlanPolicy: "required" })
+      .where(eq(projects.id, fixture.projectId));
+    await db
+      .update(repos)
+      .set({
+        fingerprint: { files: [] },
+        fingerprintStatus: "ok",
+        fingerprintVerifiedAt: new Date(),
+      })
+      .where(eq(repos.projectId, fixture.projectId));
+    const routed = await routeTrigger(db, fixture.orgId, fixture.client, fixture.payload);
+    if (!routed.runId) throw new Error("depth retry root was not created");
+    await db.update(runs).set({ status: "provisioning" }).where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "running", repositoryWriteTrackingVersion: 1 })
+      .where(eq(runs.id, routed.runId));
+    await db
+      .update(runs)
+      .set({ status: "failed", endedAt: new Date() })
+      .where(eq(runs.id, routed.runId));
+    const owner = fixture.payload.repository?.owner?.login;
+    const repo = fixture.payload.repository?.name;
+    if (!owner || !repo) throw new Error("depth retry repository missing");
+    let githubCalls = 0;
+    const countingClient = {
+      getDefaultBranchSha: async () => {
+        githubCalls += 1;
+        return fixture.live.baseSha;
+      },
+      getIssue: async (number: number) => {
+        githubCalls += 1;
+        return {
+          number,
+          title: "Require a plan",
+          body: "Implement it",
+          state: "open",
+          user: { login: "requester" },
+          labels: [],
+          html_url: `https://github.test/${owner}/${repo}/issues/${number}`,
+        };
+      },
+      listIssueComments: async () => {
+        githubCalls += 1;
+        return [
+          {
+            id: 204,
+            author: "maintainer",
+            authorType: "User",
+            body: "/builder",
+            createdAt: "2026-08-26T10:00:00Z",
+            url: "https://github.test/comments/204",
+          },
+        ];
+      },
+    } as never;
+    let parentRunId = routed.runId;
+    for (let depth = 1; depth <= 100; depth += 1) {
+      const next = (
+        await createGovernedBuilderRetry(
+          db,
+          db,
+          {
+            orgId: fixture.orgId,
+            projectId: fixture.projectId,
+            parentRunId,
+            actor: { type: "user", id: "approver" },
+            reason: `bounded depth ${depth}`,
+          },
+          { githubClient: { owner, repo, client: countingClient } },
+        )
+      ).run;
+      await db.update(runs).set({ status: "provisioning" }).where(eq(runs.id, next.id));
+      await db
+        .update(runs)
+        .set({ status: "running", repositoryWriteTrackingVersion: 1 })
+        .where(eq(runs.id, next.id));
+      await db
+        .update(runs)
+        .set({ status: "failed", endedAt: new Date() })
+        .where(eq(runs.id, next.id));
+      parentRunId = next.id;
+    }
+    const githubCallsAtLimit = githubCalls;
+    await expect(
+      createGovernedBuilderRetry(
+        db,
+        db,
+        {
+          orgId: fixture.orgId,
+          projectId: fixture.projectId,
+          parentRunId,
+          actor: { type: "user", id: "approver" },
+        },
+        { githubClient: { owner, repo, client: countingClient } },
+      ),
+    ).rejects.toMatchObject({
+      code: "governed_retry_lineage_invalid",
+      details: { reason: "lineage_depth_exceeded" },
+    });
+    expect(githubCalls).toBe(githubCallsAtLimit);
+    expect(
+      await db.select({ id: runs.id }).from(runs).where(eq(runs.retryOfRunId, parentRunId)),
+    ).toHaveLength(0);
+  }, 60_000);
 
   it("recovers an executing GitHub plan and a crash after the exact row was created", async () => {
     const executing = await githubRouteFixture("executing");

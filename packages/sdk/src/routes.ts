@@ -140,6 +140,7 @@ export const FACILITY_V1_ROUTES = [
   "POST /v1/runs/:runId/interrupt",
   "POST /v1/runs/:runId/kb-checkpoint",
   "POST /v1/runs/:runId/resume",
+  "POST /v1/runs/:runId/retry",
   "POST /v1/runs/:runId/steer",
   "POST /v1/sandbox-profiles",
   "POST /v1/tasks/:taskId/propose",

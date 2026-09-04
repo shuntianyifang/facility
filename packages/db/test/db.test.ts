@@ -43,6 +43,35 @@ async function canConnect() {
   }
 }
 
+async function expectCheckViolation(
+  operation: PromiseLike<unknown>,
+  expected: { constraintName?: string; message?: RegExp } = {},
+) {
+  try {
+    await operation;
+    throw new Error("expected Postgres to reject the operation");
+  } catch (error) {
+    let databaseError: unknown = error;
+    while (
+      databaseError &&
+      typeof databaseError === "object" &&
+      "cause" in databaseError &&
+      databaseError.cause
+    ) {
+      databaseError = databaseError.cause;
+    }
+    expect(databaseError).toEqual(
+      expect.objectContaining({
+        code: "23514",
+        ...(expected.constraintName ? { constraint_name: expected.constraintName } : {}),
+      }),
+    );
+    if (expected.message) {
+      expect(String((databaseError as { message?: unknown }).message)).toMatch(expected.message);
+    }
+  }
+}
+
 describe("db", async () => {
   const reachable = await canConnect();
   if (!reachable) {
@@ -234,6 +263,469 @@ describe("db", async () => {
     ).rejects.toMatchObject({
       cause: { code: "23505", constraint_name: "preview_sandboxes_run_uidx" },
     });
+  });
+
+  it("installs the repository-write tracking schema and indexes", async () => {
+    const columns = (await db.execute(
+      sql`
+        SELECT column_name, data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'runs'
+          AND column_name = 'repository_write_tracking_version'
+      `,
+    )) as Iterable<{
+      column_default: string | null;
+      column_name: string;
+      data_type: string;
+      is_nullable: string;
+    }>;
+    expect(Array.from(columns)).toEqual([
+      {
+        column_default: "0",
+        column_name: "repository_write_tracking_version",
+        data_type: "integer",
+        is_nullable: "NO",
+      },
+    ]);
+
+    const tableColumns = (await db.execute(
+      sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'run_repository_write_leases'
+        ORDER BY ordinal_position
+      `,
+    )) as Iterable<{ column_name: string }>;
+    expect(Array.from(tableColumns).map((row) => row.column_name)).toEqual([
+      "id",
+      "org_id",
+      "project_id",
+      "run_id",
+      "repo_id",
+      "provider",
+      "status",
+      "requested_branch",
+      "authorized_branch",
+      "base_sha",
+      "permissions",
+      "issued_at",
+      "expires_at",
+      "failure_reason",
+      "created_at",
+      "updated_at",
+    ]);
+
+    const indexes = (await db.execute(
+      sql`
+        SELECT indexname, indexdef
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND tablename = 'run_repository_write_leases'
+          AND indexname IN (
+            'run_repository_write_leases_run_created_idx',
+            'run_repository_write_leases_repo_branch_idx'
+          )
+      `,
+    )) as Iterable<{ indexdef: string; indexname: string }>;
+    const indexDefinitions = new Map(
+      Array.from(indexes).map((row) => [row.indexname, row.indexdef.toLowerCase()]),
+    );
+    expect(indexDefinitions.get("run_repository_write_leases_run_created_idx")).toContain(
+      "(run_id, created_at desc)",
+    );
+    expect(indexDefinitions.get("run_repository_write_leases_repo_branch_idx")).toContain(
+      "(org_id, project_id, repo_id, authorized_branch, created_at desc)",
+    );
+
+    const checks = (await db.execute(
+      sql`
+        SELECT conname
+        FROM pg_constraint
+        WHERE conrelid IN ('runs'::regclass, 'run_repository_write_leases'::regclass)
+          AND conname IN (
+            'runs_repository_write_tracking_version_check',
+            'run_repository_write_leases_provider_check',
+            'run_repository_write_leases_status_check',
+            'run_repository_write_leases_base_sha_check',
+            'run_repository_write_leases_branch_check',
+            'run_repository_write_leases_permissions_check',
+            'run_repository_write_leases_state_check'
+          )
+      `,
+    )) as Iterable<{ conname: string }>;
+    expect(new Set(Array.from(checks).map((row) => row.conname))).toEqual(
+      new Set([
+        "runs_repository_write_tracking_version_check",
+        "run_repository_write_leases_provider_check",
+        "run_repository_write_leases_status_check",
+        "run_repository_write_leases_base_sha_check",
+        "run_repository_write_leases_branch_check",
+        "run_repository_write_leases_permissions_check",
+        "run_repository_write_leases_state_check",
+      ]),
+    );
+  });
+
+  it("keeps repository-write evidence tenant-scoped, canonical, and append-only", async () => {
+    const orgA = newId("org");
+    const orgB = newId("org");
+    const projectA = newId("proj");
+    const projectB = newId("proj");
+    const runA = newId("run");
+    const runB = newId("run");
+    const repoA = newId("repo");
+    const repoB = newId("repo");
+
+    await db.insert(schema.orgs).values([
+      {
+        id: orgA,
+        name: "Repository write evidence A",
+        slug: `repository-write-evidence-${orgA}`,
+        settings: {},
+      },
+      {
+        id: orgB,
+        name: "Repository write evidence B",
+        slug: `repository-write-evidence-${orgB}`,
+        settings: {},
+      },
+    ]);
+    await db.insert(schema.projects).values([
+      {
+        id: projectA,
+        orgId: orgA,
+        name: "Repository write evidence A",
+        slug: "repository-write-evidence",
+        settings: {},
+      },
+      {
+        id: projectB,
+        orgId: orgB,
+        name: "Repository write evidence B",
+        slug: "repository-write-evidence",
+        settings: {},
+      },
+    ]);
+    await db.insert(schema.repos).values([
+      {
+        id: repoA,
+        orgId: orgA,
+        projectId: projectA,
+        owner: "facility-test",
+        name: `repository-write-evidence-${repoA}`,
+        defaultBranch: "main",
+      },
+      {
+        id: repoB,
+        orgId: orgB,
+        projectId: projectB,
+        owner: "facility-test",
+        name: `repository-write-evidence-${repoB}`,
+        defaultBranch: "main",
+      },
+    ]);
+    const insertedRuns = await db
+      .insert(schema.runs)
+      .values([
+        {
+          id: runA,
+          orgId: orgA,
+          projectId: projectA,
+          mode: "builder",
+          engine: "codex",
+          status: "provisioning",
+          createdBy: { type: "test", id: "repository-write-evidence" },
+        },
+        {
+          id: runB,
+          orgId: orgB,
+          projectId: projectB,
+          mode: "builder",
+          engine: "codex",
+          createdBy: { type: "test", id: "repository-write-evidence" },
+        },
+      ])
+      .returning({
+        id: schema.runs.id,
+        trackingVersion: schema.runs.repositoryWriteTrackingVersion,
+      });
+    expect(new Map(insertedRuns.map((run) => [run.id, run.trackingVersion]))).toEqual(
+      new Map([
+        [runA, 0],
+        [runB, 0],
+      ]),
+    );
+    await db
+      .update(schema.runs)
+      .set({ status: "running", repositoryWriteTrackingVersion: 1 })
+      .where(eq(schema.runs.id, runA));
+    await expectCheckViolation(
+      db.insert(schema.runs).values({
+        id: newId("run"),
+        orgId: orgA,
+        projectId: projectA,
+        mode: "builder",
+        engine: "codex",
+        repositoryWriteTrackingVersion: 1,
+        createdBy: { type: "test", id: "forged-repository-write-tracking" },
+      }),
+      { message: /must be negotiated by hello/ },
+    );
+    await expectCheckViolation(
+      db
+        .update(schema.runs)
+        .set({ repositoryWriteTrackingVersion: 1 })
+        .where(eq(schema.runs.id, runB)),
+      { message: /invalid repository write tracking transition/ },
+    );
+    await expectCheckViolation(
+      db
+        .update(schema.runs)
+        .set({ repositoryWriteTrackingVersion: 0 })
+        .where(eq(schema.runs.id, runA)),
+      { message: /invalid repository write tracking transition/ },
+    );
+    await expectCheckViolation(
+      db
+        .update(schema.runs)
+        .set({ repositoryWriteTrackingVersion: 2 })
+        .where(eq(schema.runs.id, runA)),
+      { message: /invalid repository write tracking transition/ },
+    );
+
+    const baseSha = "1".repeat(40);
+    const alternateBaseSha = "2".repeat(40);
+    const lease = (
+      overrides: Partial<typeof schema.runRepositoryWriteLeases.$inferInsert> = {},
+    ): typeof schema.runRepositoryWriteLeases.$inferInsert => ({
+      id: `rwl_${randomUUID().replaceAll("-", "")}`,
+      orgId: orgA,
+      projectId: projectA,
+      runId: runA,
+      repoId: repoA,
+      provider: "github_installation",
+      status: "reserved",
+      requestedBranch: "facility/run-a",
+      authorizedBranch: "facility/run-a",
+      baseSha,
+      permissions: ["contents"],
+      ...overrides,
+    });
+
+    await expectCheckViolation(
+      db.insert(schema.runRepositoryWriteLeases).values(
+        lease({
+          orgId: orgB,
+          projectId: projectB,
+        }),
+      ),
+      { message: /scope mismatch/ },
+    );
+    await expectCheckViolation(
+      db.insert(schema.runRepositoryWriteLeases).values(
+        lease({
+          repoId: repoB,
+        }),
+      ),
+      { message: /scope mismatch/ },
+    );
+
+    const invalidLeases: Array<{
+      constraintName: string;
+      label: string;
+      values: Partial<typeof schema.runRepositoryWriteLeases.$inferInsert>;
+    }> = [
+      {
+        label: "unknown provider",
+        constraintName: "run_repository_write_leases_provider_check",
+        values: { provider: "github_pat" },
+      },
+      {
+        label: "uppercase base SHA",
+        constraintName: "run_repository_write_leases_base_sha_check",
+        values: { baseSha: "A".repeat(40) },
+      },
+      {
+        label: "non-canonical requested branch",
+        constraintName: "run_repository_write_leases_branch_check",
+        values: { requestedBranch: " facility/run-a" },
+      },
+      {
+        label: "control character in authorized branch",
+        constraintName: "run_repository_write_leases_branch_check",
+        values: { authorizedBranch: "facility/\u0007run-a" },
+      },
+      {
+        label: "permissions in non-canonical order",
+        constraintName: "run_repository_write_leases_permissions_check",
+        values: { permissions: ["workflows", "contents"] },
+      },
+      {
+        label: "duplicate permissions",
+        constraintName: "run_repository_write_leases_permissions_check",
+        values: { permissions: ["contents", "contents"] },
+      },
+      {
+        label: "reserved row carrying issuance evidence",
+        constraintName: "run_repository_write_leases_state_check",
+        values: { issuedAt: new Date() },
+      },
+      {
+        label: "installation issuance without an expiry",
+        constraintName: "run_repository_write_leases_state_check",
+        values: { status: "issued", issuedAt: new Date() },
+      },
+      {
+        label: "installation expiry before issuance",
+        constraintName: "run_repository_write_leases_state_check",
+        values: {
+          status: "issued",
+          issuedAt: new Date("2026-01-01T00:00:01.000Z"),
+          expiresAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      },
+      {
+        label: "fallback issuance carrying a fabricated expiry",
+        constraintName: "run_repository_write_leases_state_check",
+        values: {
+          provider: "configured_fallback",
+          status: "issued",
+          issuedAt: new Date("2026-01-01T00:00:00.000Z"),
+          expiresAt: new Date("2026-01-01T01:00:00.000Z"),
+        },
+      },
+      {
+        label: "failed row without a reason",
+        constraintName: "run_repository_write_leases_state_check",
+        values: { status: "failed" },
+      },
+    ];
+    for (const invalid of invalidLeases) {
+      await expectCheckViolation(
+        db.insert(schema.runRepositoryWriteLeases).values(lease(invalid.values)),
+        { constraintName: invalid.constraintName },
+      );
+    }
+
+    const issuedLease = lease({
+      permissions: ["contents", "workflows"],
+      requestedBranch: "facility/run-a-issued",
+      authorizedBranch: "facility/run-a-issued",
+    });
+    const failedLease = lease({
+      requestedBranch: "facility/run-a-failed",
+      authorizedBranch: "facility/run-a-failed",
+    });
+    const fallbackLease = lease({
+      provider: "configured_fallback",
+      requestedBranch: "facility/run-a-fallback",
+      authorizedBranch: "facility/run-a-fallback",
+    });
+    const immutableLease = lease({
+      requestedBranch: "facility/run-a-immutable",
+      authorizedBranch: "facility/run-a-immutable",
+    });
+    await db
+      .insert(schema.runRepositoryWriteLeases)
+      .values([issuedLease, failedLease, fallbackLease, immutableLease]);
+    expect(
+      await db
+        .select({ id: schema.runRepositoryWriteLeases.id })
+        .from(schema.runRepositoryWriteLeases)
+        .where(eq(schema.runRepositoryWriteLeases.runId, runA)),
+    ).toHaveLength(4);
+
+    const issuedAt = new Date("2026-01-01T00:00:00.000Z");
+    const expiresAt = new Date("2026-01-01T01:00:00.000Z");
+    await db
+      .update(schema.runRepositoryWriteLeases)
+      .set({ status: "issued", issuedAt, expiresAt })
+      .where(eq(schema.runRepositoryWriteLeases.id, issuedLease.id));
+    await db
+      .update(schema.runRepositoryWriteLeases)
+      .set({ status: "failed", failureReason: "provider denied issuance" })
+      .where(eq(schema.runRepositoryWriteLeases.id, failedLease.id));
+    await db
+      .update(schema.runRepositoryWriteLeases)
+      .set({ status: "issued", issuedAt })
+      .where(eq(schema.runRepositoryWriteLeases.id, fallbackLease.id));
+
+    await expectCheckViolation(
+      db
+        .update(schema.runRepositoryWriteLeases)
+        .set({ status: "failed", issuedAt: null, expiresAt: null, failureReason: "rewritten" })
+        .where(eq(schema.runRepositoryWriteLeases.id, issuedLease.id)),
+      { message: /invalid run repository write lease transition/ },
+    );
+    await expectCheckViolation(
+      db
+        .update(schema.runRepositoryWriteLeases)
+        .set({ status: "issued", issuedAt, expiresAt, failureReason: null })
+        .where(eq(schema.runRepositoryWriteLeases.id, failedLease.id)),
+      { message: /invalid run repository write lease transition/ },
+    );
+    await expectCheckViolation(
+      db
+        .update(schema.runRepositoryWriteLeases)
+        .set({ status: "reserved" })
+        .where(eq(schema.runRepositoryWriteLeases.id, immutableLease.id)),
+      { message: /invalid run repository write lease transition/ },
+    );
+
+    const identityMutations: Array<{
+      label: string;
+      values: Partial<typeof schema.runRepositoryWriteLeases.$inferInsert>;
+    }> = [
+      { label: "provider", values: { provider: "configured_fallback" } },
+      { label: "requested branch", values: { requestedBranch: "facility/changed-request" } },
+      { label: "authorized branch", values: { authorizedBranch: "facility/changed-authority" } },
+      { label: "base SHA", values: { baseSha: alternateBaseSha } },
+      { label: "permissions", values: { permissions: ["contents", "workflows"] } },
+      { label: "creation time", values: { createdAt: new Date("2025-01-01T00:00:00.000Z") } },
+      {
+        label: "tenant and repository identity",
+        values: {
+          orgId: orgB,
+          projectId: projectB,
+          runId: runB,
+          repoId: repoB,
+        },
+      },
+    ];
+    for (const mutation of identityMutations) {
+      await expectCheckViolation(
+        db
+          .update(schema.runRepositoryWriteLeases)
+          .set(mutation.values)
+          .where(eq(schema.runRepositoryWriteLeases.id, immutableLease.id)),
+        { message: /identity is immutable/ },
+      );
+    }
+    await expectCheckViolation(
+      db
+        .delete(schema.runRepositoryWriteLeases)
+        .where(eq(schema.runRepositoryWriteLeases.id, issuedLease.id)),
+      { message: /evidence is append-only/ },
+    );
+
+    const finalRows = await db
+      .select({
+        failureReason: schema.runRepositoryWriteLeases.failureReason,
+        id: schema.runRepositoryWriteLeases.id,
+        status: schema.runRepositoryWriteLeases.status,
+      })
+      .from(schema.runRepositoryWriteLeases)
+      .where(eq(schema.runRepositoryWriteLeases.runId, runA));
+    expect(finalRows).toEqual(
+      expect.arrayContaining([
+        { id: issuedLease.id, status: "issued", failureReason: null },
+        { id: failedLease.id, status: "failed", failureReason: "provider denied issuance" },
+        { id: fallbackLease.id, status: "issued", failureReason: null },
+        { id: immutableLease.id, status: "reserved", failureReason: null },
+      ]),
+    );
   });
 
   it("runs schema and system-data reconciliation behind one deploy entry point", async () => {
@@ -750,6 +1242,177 @@ describe("db", async () => {
     ).toHaveLength(1);
   });
 
+  it("enforces tenant-scoped immutable linear Builder retry lineage", async () => {
+    const orgId = newId("org");
+    const projectId = newId("proj");
+    const otherProjectId = newId("proj");
+    await db.insert(schema.orgs).values({
+      id: orgId,
+      name: "Retry Lineage",
+      slug: `retry-lineage-${orgId}`,
+      settings: {},
+    });
+    await db.insert(schema.projects).values([
+      { id: projectId, orgId, name: "Retry Lineage", slug: `retry-${projectId}`, settings: {} },
+      {
+        id: otherProjectId,
+        orgId,
+        name: "Other Retry Lineage",
+        slug: `retry-${otherProjectId}`,
+        settings: {},
+      },
+    ]);
+    for (const source of [undefined, null] as const) {
+      const invalidTrigger = source === undefined ? {} : { source };
+      const invalidParent = (
+        await db
+          .insert(schema.runs)
+          .values({
+            id: newId("run"),
+            orgId,
+            projectId,
+            mode: "builder",
+            engine: "codex",
+            status: "failed",
+            trigger: invalidTrigger,
+            createdBy: { type: "system", id: "invalid-parent" },
+          })
+          .returning()
+      )[0];
+      if (!invalidParent) throw new Error("invalid retry parent fixture missing");
+      await expectCheckViolation(
+        db.insert(schema.runs).values({
+          id: newId("run"),
+          orgId,
+          projectId,
+          retryOfRunId: invalidParent.id,
+          mode: invalidParent.mode,
+          engine: invalidParent.engine,
+          trigger: invalidTrigger,
+          createdBy: { type: "system", id: "invalid-child" },
+        }),
+        { constraintName: "runs_retry_parent_state_check" },
+      );
+    }
+    const trigger = {
+      source: "plan_acceptance",
+      proposalId: newId("prop"),
+      architectRunId: newId("run"),
+      approvedPlan: "Immutable plan",
+    };
+    const root = (
+      await db
+        .insert(schema.runs)
+        .values({
+          id: newId("run"),
+          orgId,
+          projectId,
+          mode: "builder",
+          engine: "codex",
+          status: "failed",
+          trigger,
+          createdBy: { type: "system", id: "test" },
+        })
+        .returning()
+    )[0];
+    if (!root) throw new Error("retry root fixture missing");
+    for (const status of ["queued", "running"] as const) {
+      await expectCheckViolation(
+        db.update(schema.runs).set({ status }).where(eq(schema.runs.id, root.id)),
+        { constraintName: "runs_retry_parent_status_immutable" },
+      );
+    }
+    const child = (
+      await db
+        .insert(schema.runs)
+        .values({
+          id: newId("run"),
+          orgId,
+          projectId,
+          retryOfRunId: root.id,
+          mode: root.mode,
+          engine: root.engine,
+          trigger,
+          createdBy: { type: "system", id: "test" },
+        })
+        .returning()
+    )[0];
+    expect(child?.retryOfRunId).toBe(root.id);
+
+    await expect(
+      db.insert(schema.runs).values({
+        id: newId("run"),
+        orgId,
+        projectId,
+        retryOfRunId: root.id,
+        mode: root.mode,
+        engine: root.engine,
+        trigger,
+        createdBy: { type: "system", id: "duplicate" },
+      }),
+    ).rejects.toMatchObject({
+      cause: { code: "23505", constraint_name: "runs_retry_of_run_uidx" },
+    });
+    await expectCheckViolation(
+      db.insert(schema.runs).values({
+        id: newId("run"),
+        orgId,
+        projectId,
+        retryOfRunId: root.id,
+        mode: root.mode,
+        engine: root.engine,
+        trigger: { ...trigger, approvedPlan: "forged" },
+        createdBy: { type: "system", id: "forged" },
+      }),
+      { constraintName: "runs_retry_identity_check" },
+    );
+    await expect(
+      db.insert(schema.runs).values({
+        id: newId("run"),
+        orgId,
+        projectId: otherProjectId,
+        retryOfRunId: root.id,
+        mode: root.mode,
+        engine: root.engine,
+        trigger,
+        createdBy: { type: "system", id: "cross-project" },
+      }),
+    ).rejects.toMatchObject({ cause: { code: "23503", constraint_name: "runs_retry_parent_fk" } });
+    if (!child) throw new Error("retry child fixture missing");
+    await expectCheckViolation(
+      db.update(schema.runs).set({ mode: "codex-builder" }).where(eq(schema.runs.id, child.id)),
+      { constraintName: "runs_retry_identity_immutable" },
+    );
+    await expectCheckViolation(
+      db
+        .update(schema.runs)
+        .set({ trigger: { ...trigger, approvedPlan: "mutated root" } })
+        .where(eq(schema.runs.id, root.id)),
+      { constraintName: "runs_retry_parent_identity_immutable" },
+    );
+
+    await db
+      .update(schema.runs)
+      .set({ status: "failed", endedAt: new Date() })
+      .where(eq(schema.runs.id, child.id));
+    const grandchild = (
+      await db
+        .insert(schema.runs)
+        .values({
+          id: newId("run"),
+          orgId,
+          projectId,
+          retryOfRunId: child.id,
+          mode: child.mode,
+          engine: child.engine,
+          trigger,
+          createdBy: { type: "system", id: "test" },
+        })
+        .returning()
+    )[0];
+    expect(grandchild?.retryOfRunId).toBe(child.id);
+  });
+
   it("applies metering precision and index migrations in order", async () => {
     const columns = (await db.execute(
       sql`
@@ -761,6 +1424,7 @@ describe("db", async () => {
            OR (table_name = 'provider_credentials' AND column_name = 'auth_mode')
            OR (table_name = 'projects' AND column_name = 'builder_plan_policy')
            OR (table_name = 'runs' AND column_name = 'workspace_base_sha')
+           OR (table_name = 'runs' AND column_name = 'retry_of_run_id')
            OR (table_name = 'run_deliveries' AND column_name = 'base_sha')
       `,
     )) as Iterable<{ table_name: string; column_name: string; data_type: string }>;
@@ -778,6 +1442,7 @@ describe("db", async () => {
     expect(columnTypes.get("provider_credentials.auth_mode")).toBe("text");
     expect(columnTypes.get("projects.builder_plan_policy")).toBe("text");
     expect(columnTypes.get("runs.workspace_base_sha")).toBe("text");
+    expect(columnTypes.get("runs.retry_of_run_id")).toBe("text");
     expect(columnTypes.get("run_deliveries.base_sha")).toBe("text");
     const indexes = (await db.execute(
       sql`
@@ -802,6 +1467,7 @@ describe("db", async () => {
           'registry_versions_one_active_uidx',
           'runs_plan_acceptance_proposal_uidx',
           'runs_plan_acceptance_architect_run_uidx',
+          'runs_retry_of_run_uidx',
           'webhook_deliveries_pending_idx',
           'webhook_deliveries_org_created_idx',
           'idempotency_records_expiry_idx',
@@ -841,6 +1507,7 @@ describe("db", async () => {
         "runs_plan_acceptance_proposal_uidx",
         // Duplicate proposals for one architect plan cannot double-dispatch (migration 0020).
         "runs_plan_acceptance_architect_run_uidx",
+        "runs_retry_of_run_uidx",
         // Durable integration outbox and API replay records (migrations 0021-0022).
         "webhook_deliveries_pending_idx",
         "webhook_deliveries_org_created_idx",
@@ -907,6 +1574,12 @@ describe("db", async () => {
     // A developer database can include later migrations from another worktree;
     // assert this checkout's latest migration was applied without assuming it
     // is the newest row in that shared database.
+    expect(Array.from(applied).map((row) => row.name)).toContain(
+      "0044_run_repository_write_leases.sql",
+    );
+    expect(Array.from(applied).map((row) => row.name)).toContain(
+      "0045_governed_builder_retry_lineage.sql",
+    );
     expect(Array.from(applied).map((row) => row.name)).toContain("0043_builder_plan_policy.sql");
     expect(Array.from(applied).map((row) => row.name)).toContain(
       "0042_run_base_sha_provenance.sql",

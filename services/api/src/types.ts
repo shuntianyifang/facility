@@ -15,6 +15,8 @@ export type Principal = {
   githubLogin?: string;
   avatarUrl?: string;
   projectId?: string | null;
+  /** Present only for short-lived platform keys minted for one run. */
+  runId?: string | null;
   permissions: string[];
 };
 
@@ -42,6 +44,18 @@ export type AppConfig = {
   gatewayUrl: string;
   // Image the seeded default sandbox profile uses to run the platform runner.
   sandboxRunnerImage: string;
+  /**
+   * Phase-two rollout gate. Keep false until every API replica understands
+   * durable repository-write leases; otherwise a tracked run could reach an
+   * old /push-token handler and create unrecorded write authority.
+   */
+  repositoryWriteTrackingPromotionEnabled?: boolean;
+  /**
+   * Phase-two rollout gate for creating governed Builder successor rows. Keep
+   * false until every worker understands and revalidates immutable retry
+   * lineage. Existing successor rows remain enforceable when this is false.
+   */
+  governedBuilderRetryPromotionEnabled?: boolean;
   // Driver the seeded default sandbox profile uses.
   sandboxDriver: "docker" | "aws" | "vercel";
   authIdentityProvider?: "github" | "oidc";
@@ -98,11 +112,25 @@ declare module "fastify" {
     githubClientFactory?: GithubClientFactory;
     githubInstallationTokenFactory?: GithubInstallationTokenFactory;
     githubAppMetadataReader?: GithubAppMetadataReader;
+    /** Dedicated low-cardinality DB pool for terminal/retry transactions. */
+    runTransitionDb: FacilityDb;
+    acquireRunTransitionLease: (runId: string) => Promise<() => Promise<void>>;
+    acquireRunRequestLease: (runId: string) => Promise<() => Promise<void>>;
+    beginRunRequestOperation: (request: FastifyRequest) => () => Promise<void>;
   }
   interface FastifyRequest {
     principal?: Principal;
     idempotencyId?: string;
     idempotencyReplayed?: boolean;
+    releasePlatformRunRequestLease?: () => Promise<void>;
+    releaseRunnerRunRequestLease?: () => Promise<void>;
+    releaseRunTransitionLease?: () => Promise<void>;
+    runRequestOperationCount?: number;
+    runRequestAborted?: boolean;
+    runRequestAbortReleaseDeferred?: boolean;
+    runRequestAbortCleanupPromise?: Promise<void>;
+    runRequestHandlerStarted?: boolean;
+    runRequestHandlerSettled?: boolean;
     audit: (
       action: string,
       target: AuditInsert["target"],
@@ -115,5 +143,7 @@ declare module "fastify" {
     public?: boolean;
     orgAdmin?: boolean;
     idempotent?: boolean;
+    /** Terminal/retry run control is never callable by a run-scoped platform key. */
+    runLifecycle?: boolean;
   }
 }

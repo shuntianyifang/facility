@@ -170,6 +170,7 @@ export const RunSchema = z.object({
   mode: z.string(),
   engine: z.string(),
   status: z.string(),
+  retryOfRunId: z.string().nullable(),
   trigger: AnyObject,
   sandbox: AnyObject,
   receipt: z

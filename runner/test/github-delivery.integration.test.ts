@@ -129,13 +129,13 @@ async function startJsonServer(
   };
 }
 
-async function startFacilityServer(token: string) {
+async function startFacilityServer(token: string, options: { pushTokenReply?: JsonReply } = {}) {
   return startJsonServer((request) => {
     if (request.method === "POST" && request.path === "/internal/runs/run_integration/push-token") {
       if (request.headers.authorization !== "Bearer runner-integration-token") {
         return { status: 401, body: { message: "invalid runner token" } };
       }
-      return { body: { token } };
+      return options.pushTokenReply ?? { body: { token } };
     }
     if (request.method === "POST" && request.path === "/internal/runs/run_integration/events") {
       if (request.headers.authorization !== "Bearer runner-integration-token") {
@@ -450,6 +450,9 @@ describe.sequential("signed GitHub delivery integration", () => {
       execFileSync("git", ["rev-parse", "HEAD"], { cwd: fixture.repo, encoding: "utf8" }).trim(),
     ).toBe(fixture.baseSha);
     expect(facilityRequests(facility.requests, "/push-token")).toHaveLength(1);
+    expect(
+      JSON.parse(facilityRequests(facility.requests, "/push-token")[0]?.body ?? "null"),
+    ).toEqual({ workflowWrite: false });
     expect(facilityRequests(facility.requests, "/events")).toHaveLength(0);
     expect(github.originalUrls).toEqual([
       "https://api.github.com/repos/acme/widget/git/ref/heads/feature/task",
@@ -485,6 +488,82 @@ describe.sequential("signed GitHub delivery integration", () => {
     expect(github.committed()).toBe(true);
     expect(facility.handlerErrors).toEqual([]);
     expect(github.handlerErrors).toEqual([]);
+  });
+
+  it("requests workflow write only when the verified final diff contains a workflow", async () => {
+    const fixture = await deliveryFixture(
+      "ci: update preview validation",
+      "ci: update preview validation",
+    );
+    await mkdir(join(fixture.repo, ".github", "workflows"), { recursive: true });
+    await writeFile(
+      join(fixture.repo, ".github", "workflows", "preview.yml"),
+      "name: Preview\non: pull_request\n",
+    );
+    const token = "installation-token-workflow";
+    const facility = await startFacilityServer(token);
+    const github = await startGithubServer({
+      scenario: "success",
+      token,
+      baseSha: fixture.baseSha,
+    });
+    configureRunner(facility.origin);
+
+    const result = await shipGitChanges(fixture.bundle, {
+      root: fixture.workspace,
+      githubFetch: github.githubFetch,
+    });
+
+    expect(result).toMatchObject({ changed: true, headSha: "signed_sha" });
+    expect(
+      JSON.parse(facilityRequests(facility.requests, "/push-token")[0]?.body ?? "null"),
+    ).toEqual({ workflowWrite: true });
+    const mutation = JSON.parse(github.requests.at(-1)?.body ?? "null");
+    expect(mutation.variables.input.fileChanges.additions).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: ".github/workflows/preview.yml" })]),
+    );
+    expect(github.committed()).toBe(true);
+  });
+
+  it("does not mutate GitHub when workflow-capable token issuance is rejected", async () => {
+    const fixture = await deliveryFixture(
+      "ci: update preview validation",
+      "ci: update preview validation",
+    );
+    await mkdir(join(fixture.repo, ".github", "workflows"), { recursive: true });
+    await writeFile(
+      join(fixture.repo, ".github", "workflows", "preview.yml"),
+      "name: Preview\non: pull_request\n",
+    );
+    const token = "installation-token-must-not-be-returned";
+    const facility = await startFacilityServer(token, {
+      pushTokenReply: {
+        status: 403,
+        body: { error: { code: "workflow_permission_unavailable" } },
+      },
+    });
+    const github = await startGithubServer({
+      scenario: "success",
+      token,
+      baseSha: fixture.baseSha,
+    });
+    configureRunner(facility.origin);
+
+    const result = await shipGitChanges(fixture.bundle, {
+      root: fixture.workspace,
+      githubFetch: github.githubFetch,
+    });
+
+    expect(result).toMatchObject({
+      changed: true,
+      pushError: expect.stringContaining("workflow_permission_unavailable"),
+    });
+    expect(
+      JSON.parse(facilityRequests(facility.requests, "/push-token")[0]?.body ?? "null"),
+    ).toEqual({ workflowWrite: true });
+    expect(github.originalUrls).toEqual([]);
+    expect(github.committed()).toBe(false);
+    expect(failureEvent(facility.requests)).toContain("workflow_permission_unavailable");
   });
 
   it.each([

@@ -13,7 +13,7 @@ import {
   runs,
 } from "@facility/db";
 import { agentDefTriggersBuilder, isBuilderMode } from "@facility/run-objective";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { ApiError } from "./errors.js";
 
 export type BuilderPlanPolicy = "optional" | "required";
@@ -45,6 +45,8 @@ export type BuilderPlanDispatchInput = {
   trigger: unknown;
   gh?: unknown;
   runId?: string | null;
+  /** Canonical root that consumed Gate 1 when dispatching an immutable retry child. */
+  acceptanceRunId?: string | null;
   actor?: AuditInsert["actor"];
   source?: string;
   /** Trusted, live evidence resolved by the canonical executor/worker, never request JSON. */
@@ -108,6 +110,44 @@ export function builderPlanDecision(input: BuilderPlanDecisionInput): BuilderPla
 
 export function builderIdentity(mode: string, agentName?: string | null) {
   return isBuilderMode(mode) || (agentName ? isBuilderMode(agentName) : false);
+}
+
+/**
+ * Generic session resume is intentionally unavailable to every Builder,
+ * regardless of the project's current Gate 1 policy. Builder recovery must
+ * create a governed immutable successor so the original attempt stays sealed.
+ */
+export async function assertGenericRunResumeAllowed(
+  db: FacilityDb,
+  run: Pick<typeof runs.$inferSelect, "orgId" | "projectId" | "agentDefId" | "mode" | "trigger">,
+): Promise<void> {
+  const trigger = objectValue(run.trigger);
+  let isBuilder = builderIdentity(run.mode) || trigger.source === "plan_acceptance";
+  if (!isBuilder && run.agentDefId) {
+    const agent = (
+      await db
+        .select({ name: agentDefs.name, triggers: agentDefs.triggers })
+        .from(agentDefs)
+        .where(
+          and(
+            eq(agentDefs.orgId, run.orgId),
+            eq(agentDefs.projectId, run.projectId),
+            eq(agentDefs.id, run.agentDefId),
+          ),
+        )
+        .limit(1)
+    )[0];
+    isBuilder = Boolean(
+      agent && (builderIdentity(run.mode, agent.name) || agentDefTriggersBuilder(agent.triggers)),
+    );
+  }
+  if (isBuilder) {
+    throw new ApiError(
+      409,
+      "builder_resume_forbidden",
+      "Builder runs must be recovered through a governed immutable retry",
+    );
+  }
 }
 
 export function isBuilderPlanDenialError(error: unknown): error is ApiError {
@@ -394,6 +434,7 @@ async function validatePlanAcceptance(
   ) {
     return invalid("builder_plan_expired", "proposal_expired");
   }
+  const acceptanceRunId = input.acceptanceRunId ?? input.runId;
   const linkedRuns = await db
     .select({ id: runs.id })
     .from(runs)
@@ -403,10 +444,11 @@ async function validatePlanAcceptance(
         eq(runs.projectId, input.projectId),
         sql`${runs.trigger}->>'source' = 'plan_acceptance'`,
         sql`${runs.trigger}->>'proposalId' = ${proposal.id}`,
+        isNull(runs.retryOfRunId),
       ),
     )
     .limit(2);
-  if (linkedRuns.some((run) => run.id !== input.runId)) {
+  if (linkedRuns.some((run) => run.id !== acceptanceRunId)) {
     return invalid("builder_plan_already_consumed", "proposal_linked_to_another_run");
   }
   const architectLinkedRuns = await db
@@ -418,16 +460,17 @@ async function validatePlanAcceptance(
         eq(runs.projectId, input.projectId),
         sql`${runs.trigger}->>'source' = 'plan_acceptance'`,
         sql`${runs.trigger}->>'architectRunId' = ${architectRunId}`,
+        isNull(runs.retryOfRunId),
       ),
     )
     .limit(2);
-  if (architectLinkedRuns.some((run) => run.id !== input.runId)) {
+  if (architectLinkedRuns.some((run) => run.id !== acceptanceRunId)) {
     return invalid("builder_plan_already_consumed", "architect_plan_linked_to_another_run");
   }
   const dispatchingLinkedRun = Boolean(
-    input.runId &&
-      linkedRuns.some((run) => run.id === input.runId) &&
-      architectLinkedRuns.some((run) => run.id === input.runId),
+    acceptanceRunId &&
+      linkedRuns.some((run) => run.id === acceptanceRunId) &&
+      architectLinkedRuns.some((run) => run.id === acceptanceRunId),
   );
   if (proposal.state === "executed" && !dispatchingLinkedRun) {
     return invalid("builder_plan_context_invalid", "executed_proposal_missing_linked_run");

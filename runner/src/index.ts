@@ -74,6 +74,20 @@ let activeEngineChild: ReturnType<typeof spawn> | null = null;
 let clearInterruptEscalation: (() => void) | null = null;
 let interruptRequested = false;
 let engineEventTransportDegraded = false;
+let negotiatedRepositoryWriteTrackingVersion: 0 | 1 = 0;
+
+export function repositoryWriteTrackingVersionFromHello(value: unknown): 0 | 1 {
+  return value === 1 ? 1 : 0;
+}
+
+export function repositoryWriteTokenRequest(
+  version: 0 | 1,
+  workflowWrite: boolean,
+  requestedBranch: string,
+  baseSha: string,
+) {
+  return version === 1 ? { workflowWrite, requestedBranch, baseSha } : { workflowWrite };
+}
 
 // Secret values injected into the run (virtual key, platform key, runner token,
 // repo clone token) that must never surface in captured check output persisted to
@@ -116,7 +130,11 @@ async function main() {
     phases.start("bootstrap");
     const hello = await api<Record<string, unknown>>(`/internal/runs/${currentRunId()}/hello`, {
       method: "POST",
+      body: JSON.stringify({ repositoryWriteTrackingVersion: 1 }),
     });
+    negotiatedRepositoryWriteTrackingVersion = repositoryWriteTrackingVersionFromHello(
+      hello.repositoryWriteTrackingVersion,
+    );
     bundle = (await fetchJson(String(hello.bundleUrl), {
       headers: { authorization: `Bearer ${runnerToken()}` },
     })) as RunBundle;
@@ -1908,15 +1926,34 @@ export async function shipGitChanges(
         runId,
       );
     }
-    const { token } = await api<{ token: string }>(`/internal/runs/${runId}/push-token`, {
+    const workflowWrite = githubWorkflowWriteRequired(changes);
+    const { token, authorizedBranch } = await api<{
+      token: string;
+      authorizedBranch: string | null;
+    }>(`/internal/runs/${runId}/push-token`, {
       method: "POST",
+      body: JSON.stringify(
+        repositoryWriteTokenRequest(
+          negotiatedRepositoryWriteTrackingVersion,
+          workflowWrite,
+          requestedBranch,
+          baseSha,
+        ),
+      ),
     });
     secretsToRedact.add(token);
+    if (
+      negotiatedRepositoryWriteTrackingVersion === 1 &&
+      (!authorizedBranch || (repairRepositoryMode(mode) && authorizedBranch !== requestedBranch))
+    ) {
+      throw new Error("repository_write_authorized_branch_mismatch");
+    }
+    const deliveryBranch = authorizedBranch ?? requestedBranch;
     const published = repairRepositoryMode(mode)
       ? await publishVerifiedGithubBranchUpdate({
           repo,
           token,
-          branch: requestedBranch,
+          branch: deliveryBranch,
           expectedHeadSha: baseSha,
           commitMessage: delivery.commitMessage,
           changes,
@@ -1926,7 +1963,8 @@ export async function shipGitChanges(
       : await publishVerifiedGithubChanges({
           repo,
           token,
-          requestedBranch,
+          authorizedBranch: deliveryBranch,
+          branchReserved: negotiatedRepositoryWriteTrackingVersion === 1,
           baseSha,
           commitMessage: delivery.commitMessage,
           changes,
@@ -1958,6 +1996,10 @@ export async function shipGitChanges(
 type GithubFileChange =
   | { kind: "addition"; path: string; contents: string }
   | { kind: "deletion"; path: string };
+
+export function githubWorkflowWriteRequired(changes: readonly { path: string }[]) {
+  return changes.some(({ path }) => path.startsWith(".github/workflows/"));
+}
 
 const SEMANTIC_BRANCH =
   /^(feature|fix|chore|ci|docs|refactor|perf|test|build|revert)\/[a-z0-9][a-z0-9._/-]*$/;
@@ -2435,7 +2477,9 @@ function objectValue(value: unknown): Record<string, unknown> {
 export async function publishVerifiedGithubChanges(input: {
   repo: string;
   token: string;
-  requestedBranch: string;
+  authorizedBranch: string;
+  /** False only during phase-one rolling compatibility (retry stays denied). */
+  branchReserved?: boolean;
   baseSha: string;
   commitMessage: string;
   changes: GithubFileChange[];
@@ -2444,13 +2488,10 @@ export async function publishVerifiedGithubChanges(input: {
 }) {
   assertGithubCommitMessages(input.commitMessage, input.changes.length, input.runId);
   const request = input.fetchImpl ?? fetch;
-  const branch = await availableGithubBranch(
-    request,
-    input.repo,
-    input.requestedBranch,
-    input.runId,
-    input.token,
-  );
+  const requestedBranch = semanticDeliveryBranch(input.authorizedBranch, "");
+  const branch = input.branchReserved
+    ? requestedBranch
+    : await availableGithubBranch(request, input.repo, requestedBranch, input.runId, input.token);
   await githubRequest(request, `https://api.github.com/repos/${input.repo}/git/refs`, input.token, {
     method: "POST",
     body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: input.baseSha }),

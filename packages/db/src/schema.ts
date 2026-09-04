@@ -485,6 +485,15 @@ export const runs = pgTable(
     mode: text("mode").notNull(),
     engine: text("engine").notNull(),
     status: text("status").notNull().default("queued"),
+    // Governed Builder retries are immutable successor rows. Composite scope
+    // and identity enforcement lives in migration 0045 because the parent is
+    // another row in this table.
+    retryOfRunId: text("retry_of_run_id"),
+    // Zero write-lease rows are meaningful only after the upgraded runner has
+    // explicitly negotiated this protocol during /hello.
+    repositoryWriteTrackingVersion: integer("repository_write_tracking_version")
+      .notNull()
+      .default(0),
     trigger: jsonb("trigger").notNull().default(sql`'{}'::jsonb`),
     sandbox: jsonb("sandbox").notNull().default(sql`'{}'::jsonb`),
     receipt: jsonb("receipt"),
@@ -513,6 +522,18 @@ export const runs = pgTable(
     uniqueIndex("runs_org_ci_repair_key_uidx")
       .on(table.orgId, table.ciRepairKey)
       .where(sql`${table.ciRepairKey} is not null`),
+    uniqueIndex("runs_org_project_id_uidx").on(table.orgId, table.projectId, table.id),
+    uniqueIndex("runs_retry_of_run_uidx")
+      .on(table.orgId, table.projectId, table.retryOfRunId)
+      .where(sql`${table.retryOfRunId} is not null`),
+    check(
+      "runs_retry_not_self_check",
+      sql`${table.retryOfRunId} is null or ${table.retryOfRunId} <> ${table.id}`,
+    ),
+    check(
+      "runs_repository_write_tracking_version_check",
+      sql`${table.repositoryWriteTrackingVersion} in (0, 1)`,
+    ),
   ],
 );
 
@@ -585,6 +606,95 @@ export const runDeliveries = pgTable(
       sql`${table.status} in ('pending', 'delivering', 'delivered', 'blocked')`,
     ),
     check("run_deliveries_attempts_check", sql`${table.attempts} >= 0`),
+  ],
+);
+
+export const runRepositoryWriteLeases = pgTable(
+  "run_repository_write_leases",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id")
+      .notNull()
+      .references(() => orgs.id),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    runId: text("run_id")
+      .notNull()
+      .references(() => runs.id),
+    repoId: text("repo_id")
+      .notNull()
+      .references(() => repos.id),
+    provider: text("provider").notNull(),
+    status: text("status").notNull().default("reserved"),
+    requestedBranch: text("requested_branch").notNull(),
+    authorizedBranch: text("authorized_branch").notNull(),
+    baseSha: text("base_sha").notNull(),
+    permissions: jsonb("permissions").notNull(),
+    issuedAt: timestamp("issued_at", { withTimezone: true }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    failureReason: text("failure_reason"),
+    ...timestamps,
+  },
+  (table) => [
+    index("run_repository_write_leases_run_created_idx").on(table.runId, table.createdAt.desc()),
+    index("run_repository_write_leases_repo_branch_idx").on(
+      table.orgId,
+      table.projectId,
+      table.repoId,
+      table.authorizedBranch,
+      table.createdAt.desc(),
+    ),
+    check(
+      "run_repository_write_leases_provider_check",
+      sql`${table.provider} in ('github_installation', 'configured_fallback')`,
+    ),
+    check(
+      "run_repository_write_leases_status_check",
+      sql`${table.status} in ('reserved', 'issued', 'failed')`,
+    ),
+    check("run_repository_write_leases_base_sha_check", sql`${table.baseSha} ~ '^[0-9a-f]{40}$'`),
+    check(
+      "run_repository_write_leases_branch_check",
+      sql`char_length(${table.requestedBranch}) between 1 and 255
+        and ${table.requestedBranch} = btrim(${table.requestedBranch})
+        and ${table.requestedBranch} !~ '[[:cntrl:]]'
+        and char_length(${table.authorizedBranch}) between 1 and 255
+        and ${table.authorizedBranch} = btrim(${table.authorizedBranch})
+        and ${table.authorizedBranch} !~ '[[:cntrl:]]'`,
+    ),
+    check(
+      "run_repository_write_leases_permissions_check",
+      sql`${table.permissions} in ('["contents"]'::jsonb, '["contents", "workflows"]'::jsonb)`,
+    ),
+    check(
+      "run_repository_write_leases_state_check",
+      sql`(
+          ${table.status} = 'reserved'
+          and ${table.issuedAt} is null
+          and ${table.expiresAt} is null
+          and ${table.failureReason} is null
+        ) or (
+          ${table.status} = 'failed'
+          and ${table.issuedAt} is null
+          and ${table.expiresAt} is null
+          and ${table.failureReason} is not null
+        ) or (
+          ${table.status} = 'issued'
+          and ${table.issuedAt} is not null
+          and ${table.failureReason} is null
+          and (
+            (
+              ${table.provider} = 'github_installation'
+              and ${table.expiresAt} is not null
+              and ${table.expiresAt} > ${table.issuedAt}
+            ) or (
+              ${table.provider} = 'configured_fallback'
+              and ${table.expiresAt} is null
+            )
+          )
+        )`,
+    ),
   ],
 );
 

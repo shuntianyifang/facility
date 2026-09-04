@@ -49,6 +49,8 @@ const EnvSchema = z
     // Container image that runs the Facility runner for platform-lane runs. The
     // seeded default sandbox profile and `facility doctor` both key off this.
     FACILITY_RUNNER_IMAGE: z.string().default("facility-runner:dev"),
+    FACILITY_REPOSITORY_WRITE_TRACKING_PROMOTION: z.enum(["0", "1"]).default("0"),
+    FACILITY_GOVERNED_BUILDER_RETRY_PROMOTION: z.enum(["0", "1"]).default("0"),
     // Driver the seeded default sandbox profile uses. Must match the deployment:
     // "docker" for local/self-host, "vercel" for managed Sandboxes, or "aws"
     // for the CodeBuild development provider.
@@ -270,6 +272,9 @@ export function readConfig(env = process.env): AppConfig {
     sandboxGatewayUrl: parsed.SANDBOX_GATEWAY_URL ?? parsed.GATEWAY_URL,
     gatewayUrl: parsed.GATEWAY_URL,
     sandboxRunnerImage: parsed.FACILITY_RUNNER_IMAGE,
+    repositoryWriteTrackingPromotionEnabled:
+      parsed.FACILITY_REPOSITORY_WRITE_TRACKING_PROMOTION === "1",
+    governedBuilderRetryPromotionEnabled: parsed.FACILITY_GOVERNED_BUILDER_RETRY_PROMOTION === "1",
     sandboxDriver: parsed.FACILITY_SANDBOX_DRIVER,
     authIdentityProvider: parsed.AUTH_IDENTITY_PROVIDER,
     authCallbackUrl: parsed.AUTH_CALLBACK_URL ?? `${webUrl.replace(/\/$/, "")}/api/auth/callback`,
@@ -332,11 +337,38 @@ function parseJwks(value: string | undefined): { keys: Record<string, unknown>[]
     ) {
       throw new Error("FACILITY_OAUTH_JWKS keys must be private ES256 JWKs with unique kid values");
     }
+    // `key_ops` states the operations a key may be used for (RFC 7517 section
+    // 4.3). This variable holds the keys the instance signs its own MCP tokens
+    // with, so a set that forbids signing is a contradiction rather than a
+    // policy. Name it at startup: left alone it surfaces later as an unexplained
+    // "no signing key" at token issuance, and stripped it would silently grant
+    // an operation the operator wrote down as not permitted.
+    if (key.key_ops !== undefined && !asSigningOps(key.key_ops)) {
+      throw new Error('FACILITY_OAUTH_JWKS keys with key_ops must permit "sign"');
+    }
   }
   if (new Set((keys as Record<string, unknown>[]).map((key) => key.kid)).size !== keys.length) {
     throw new Error("FACILITY_OAUTH_JWKS key ids must be unique");
   }
-  return { keys: keys as Record<string, unknown>[] };
+  // Past that check `key_ops` only repeats what this variable already means,
+  // and it cannot survive: `oauthConfigFromApp` derives the verification keys
+  // from these objects, and a set carrying "sign" makes jose skip the derived
+  // key as a verification candidate. `ext` is a WebCrypto export artifact with
+  // no meaning in a stored JWK. Drop both here, where the published JWKS and
+  // the local verifier read one shape, so an operator can paste the output of
+  // `crypto.subtle.exportKey("jwk", ...)` verbatim.
+  return {
+    keys: (keys as Record<string, unknown>[]).map(({ key_ops: _keyOps, ext: _ext, ...key }) => key),
+  };
+}
+
+function asSigningOps(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((entry) => typeof entry === "string") &&
+    value.includes("sign")
+  );
 }
 
 function canonicalMcpResourceUrl(value: string) {

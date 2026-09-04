@@ -48,7 +48,8 @@ jobs:
 {{TOOLCHAIN_STEPS_CONDITIONAL}}
       - name: Provision environment
         if: steps.workflow-change.outputs.changed != 'true'
-        run: {{PROVISION_CMD}}
+        run: |
+{{PROVISION_RUN}}
 
       - name: Capture review baseline
         id: review-start

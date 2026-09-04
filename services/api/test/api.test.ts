@@ -296,7 +296,7 @@ describe("api", async () => {
             : 0),
         0,
       ),
-    ).toBe(140);
+    ).toBe(141);
     expect(document.paths["/v1/projects"]?.get?.security).toEqual([
       { bearerAuth: [] },
       { sessionCookie: [] },
@@ -310,6 +310,13 @@ describe("api", async () => {
       ]),
     );
     expect(document.paths["/v1/projects"]?.post?.parameters).toContainEqual(
+      expect.objectContaining({ name: "Idempotency-Key", in: "header" }),
+    );
+    expect(document.paths["/v1/runs/{runId}/retry"]?.post).toMatchObject({
+      "x-facility-permission": "runs:trigger",
+      tags: ["Runs"],
+    });
+    expect(document.paths["/v1/runs/{runId}/retry"]?.post?.parameters).toContainEqual(
       expect.objectContaining({ name: "Idempotency-Key", in: "header" }),
     );
     expect(document.paths["/health"]?.get?.security).toEqual([]);
@@ -2132,26 +2139,77 @@ describe("api", async () => {
       data: { source: "plan_acceptance", architectRunId: architectRun.id },
     });
 
-    // Optional projects preserve the legacy resume shape: provenance is used
-    // only for the policy preflight and is not copied into the new row, where
-    // the plan-acceptance uniqueness indexes would reject it.
+    // Builder attempts are immutable even while the project policy is optional.
+    // Generic session resume must never bypass the governed successor route.
     await db
       .update(runs)
       .set({ status: "failed", engine: "claude_code", engineSessionId: "plan-resume-session" })
       .where(eq(runs.id, builderRuns[0]?.id ?? ""));
+
+    const originalRetryEnqueue = app.enqueue;
+    const originalRetryFactory = app.githubClientFactory;
+    const retryEnqueues: Array<{ queue: string; data: Record<string, unknown> }> = [];
+    let retryGithubCalls = 0;
+    app.enqueue = async (queue, data) => {
+      retryEnqueues.push({ queue, data });
+      return null;
+    };
+    app.githubClientFactory = async () => {
+      retryGithubCalls += 1;
+      throw new Error("legacy retry reached GitHub");
+    };
+    try {
+      const promotionDisabled = await app.inject({
+        method: "POST",
+        url: `/v1/runs/${builderRuns[0]?.id}/retry`,
+        headers: { cookie, "idempotency-key": `retry-disabled-${Date.now()}` },
+      });
+      expect(promotionDisabled.statusCode, promotionDisabled.body).toBe(409);
+      expect(promotionDisabled.json().error.code).toBe("governed_retry_promotion_disabled");
+      expect(
+        await db
+          .select({ id: runs.id })
+          .from(runs)
+          .where(eq(runs.retryOfRunId, builderRuns[0]?.id ?? "")),
+      ).toHaveLength(0);
+      expect(retryEnqueues).toHaveLength(0);
+
+      config.governedBuilderRetryPromotionEnabled = true;
+      const legacyDenied = await app.inject({
+        method: "POST",
+        url: `/v1/runs/${builderRuns[0]?.id}/retry`,
+        headers: { cookie, "idempotency-key": `retry-legacy-${Date.now()}` },
+      });
+      expect(legacyDenied.statusCode, legacyDenied.body).toBe(409);
+      expect(legacyDenied.json().error).toMatchObject({
+        code: "governed_retry_requires_fresh_gate1",
+        details: {
+          reason: "legacy_repository_write_tracking_unavailable",
+          requiredAction: "run_architect_and_approve_new_plan",
+        },
+      });
+      expect(retryGithubCalls).toBe(0);
+      expect(retryEnqueues).toHaveLength(0);
+      expect(
+        await db
+          .select({ id: runs.id })
+          .from(runs)
+          .where(eq(runs.retryOfRunId, builderRuns[0]?.id ?? "")),
+      ).toHaveLength(0);
+    } finally {
+      config.governedBuilderRetryPromotionEnabled = false;
+      app.enqueue = originalRetryEnqueue;
+      app.githubClientFactory = originalRetryFactory;
+    }
+
     const resumedPlanRun = await app.inject({
       method: "POST",
       url: `/v1/runs/${builderRuns[0]?.id}/resume`,
       headers: { cookie },
       payload: { message: "Continue the optional legacy run" },
     });
-    expect(resumedPlanRun.statusCode).toBe(200);
-    expect(resumedPlanRun.json().trigger).toMatchObject({
-      type: "resume",
-      resumeOf: builderRuns[0]?.id,
-    });
-    expect(resumedPlanRun.json().trigger).not.toHaveProperty("source");
-    expect(resumedPlanRun.json().trigger).not.toHaveProperty("proposalId");
+    expect(resumedPlanRun.statusCode).toBe(409);
+    expect(resumedPlanRun.json().error.code).toBe("builder_resume_forbidden");
 
     const duplicateProposal = await createInternalPlanProposal(
       architectRun.id,
@@ -3067,7 +3125,11 @@ describe("api", async () => {
       throw new Error("MCP Builder denial reached GitHub");
     }) as unknown as GithubClientFactory;
 
-    const executeDenied = async (toolName: string, args: Record<string, unknown>) => {
+    const executeDenied = async (
+      toolName: string,
+      args: Record<string, unknown>,
+      expectedError = "builder_plan_required",
+    ) => {
       const before = await db
         .select({ id: runs.id })
         .from(runs)
@@ -3094,7 +3156,7 @@ describe("api", async () => {
       expect(approved.statusCode, approved.body).toBe(200);
       expect(approved.json()).toMatchObject({
         state: "execution_failed",
-        executionError: "builder_plan_required",
+        executionError: expectedError,
       });
       expect(
         await db.select({ id: runs.id }).from(runs).where(eq(runs.projectId, target.projectId)),
@@ -3113,14 +3175,79 @@ describe("api", async () => {
         number: 204,
         agentName: "builder",
       });
-      await executeDenied("facility_resume_run", {
-        runId: terminalBuilder.id,
-        message: "Attempt governed MCP resume",
+      await executeDenied(
+        "facility_resume_run",
+        {
+          runId: terminalBuilder.id,
+          message: "Attempt governed MCP resume",
+        },
+        "builder_resume_forbidden",
+      );
+      await db
+        .update(conversations)
+        .set({
+          lastRunId: terminalBuilder.id,
+          engineSessionId: terminalBuilder.engineSessionId,
+          status: "idle",
+        })
+        .where(eq(conversations.id, governedConversation.id));
+      // Conversation continuation is an implicit session resume. Verify both
+      // producers reject it synchronously even while Gate 1 is optional, and
+      // leave no message/run/status churn for a worker to clean up later.
+      await db
+        .update(projects)
+        .set({ builderPlanPolicy: "optional" })
+        .where(and(eq(projects.orgId, orgId), eq(projects.id, target.projectId)));
+      const conversationRunsBefore = await db
+        .select({ id: runs.id })
+        .from(runs)
+        .where(eq(runs.projectId, target.projectId));
+      const conversationMessagesBefore = await db
+        .select({ id: conversationMessages.id })
+        .from(conversationMessages)
+        .where(eq(conversationMessages.conversationId, governedConversation.id));
+      await executeDenied(
+        "facility_send_conversation_message",
+        {
+          conversationId: governedConversation.id,
+          body: "Attempt governed Builder conversation turn",
+        },
+        "builder_resume_forbidden",
+      );
+      const restConversationDenied = await app.inject({
+        method: "POST",
+        url: `/v1/conversations/${governedConversation.id}/messages`,
+        headers: { cookie },
+        payload: { body: "Attempt governed Builder REST conversation turn" },
       });
-      await executeDenied("facility_send_conversation_message", {
-        conversationId: governedConversation.id,
-        body: "Attempt governed Builder conversation turn",
+      expect(restConversationDenied.statusCode, restConversationDenied.body).toBe(409);
+      expect(restConversationDenied.json().error.code).toBe("builder_resume_forbidden");
+      expect(
+        await db.select({ id: runs.id }).from(runs).where(eq(runs.projectId, target.projectId)),
+      ).toHaveLength(conversationRunsBefore.length);
+      expect(
+        await db
+          .select({ id: conversationMessages.id })
+          .from(conversationMessages)
+          .where(eq(conversationMessages.conversationId, governedConversation.id)),
+      ).toHaveLength(conversationMessagesBefore.length);
+      expect(
+        (
+          await db
+            .select()
+            .from(conversations)
+            .where(eq(conversations.id, governedConversation.id))
+            .limit(1)
+        )[0],
+      ).toMatchObject({
+        status: "idle",
+        lastRunId: terminalBuilder.id,
+        engineSessionId: terminalBuilder.engineSessionId,
       });
+      await db
+        .update(projects)
+        .set({ builderPlanPolicy: "required" })
+        .where(and(eq(projects.orgId, orgId), eq(projects.id, target.projectId)));
       const beforeRepos = await db
         .select({ id: repos.id })
         .from(repos)
@@ -3167,13 +3294,9 @@ describe("api", async () => {
         .filter((event) => event.action === "run.builder_plan_denied")
         .map((event) => (event.payload as { source?: unknown }).source);
       expect(sources).toEqual(
-        expect.arrayContaining([
-          "mcp_trigger_run",
-          "mcp_trigger_github_issue",
-          "mcp_resume_run",
-          "mcp_conversation_message",
-        ]),
+        expect.arrayContaining(["mcp_trigger_run", "mcp_trigger_github_issue"]),
       );
+      expect(sources).not.toContain("mcp_conversation_message");
     } finally {
       app.enqueue = originalEnqueue;
       app.githubClientFactory = originalFactory;
@@ -3259,8 +3382,7 @@ describe("api", async () => {
             id: newId("run"),
             orgId,
             projectId: target.projectId,
-            agentDefId: target.agent.id,
-            mode: "builder",
+            mode: "analyst",
             engine: "claude_code",
             status: "running",
             createdBy: { type: "test", id: "mcp-interactive" },
@@ -3282,16 +3404,11 @@ describe("api", async () => {
             id: newId("run"),
             orgId,
             projectId: target.projectId,
-            agentDefId: target.agent.id,
-            mode: "builder",
+            mode: "analyst",
             engine: "claude_code",
             engineSessionId: "session_mcp_resume",
             status: "succeeded",
-            trigger: {
-              source: "plan_acceptance",
-              proposalId: newId("prop"),
-              architectRunId: newId("run"),
-            },
+            trigger: { type: "manual" },
             createdBy: { type: "test", id: "mcp-interactive" },
           })
           .returning()
@@ -4669,7 +4786,7 @@ describe("api", async () => {
             orgId,
             projectId: target.projectId,
             agentDefId: target.agent.id,
-            mode: "builder",
+            mode: "analyst",
             engine: "claude_code",
             status: "running",
             sandbox: { runnerTokenHash: await hashKey(parentToken) },
@@ -6957,7 +7074,7 @@ describe("api", async () => {
             orgId,
             projectId: target.projectId,
             agentDefId: target.agent.id,
-            mode: "builder",
+            mode: "analyst",
             engine: "claude_code",
             status: "succeeded",
             engineSessionId: "sess_resume_1",
@@ -6983,7 +7100,7 @@ describe("api", async () => {
         { queue: "runs.dispatch", data: { runId: resumed.json().id, orgId } },
       ]);
 
-      const runningParent = (
+      const builderParent = (
         await db
           .insert(runs)
           .values({
@@ -6992,6 +7109,29 @@ describe("api", async () => {
             projectId: target.projectId,
             agentDefId: target.agent.id,
             mode: "builder",
+            engine: "claude_code",
+            status: "failed",
+            engineSessionId: "sess_builder_resume_forbidden",
+            createdBy: { type: "user", id: "test" },
+          })
+          .returning()
+      )[0];
+      const optionalBuilderResume = await app.inject({
+        method: "POST",
+        url: `/v1/runs/${builderParent?.id}/resume`,
+        headers: { cookie },
+      });
+      expect(optionalBuilderResume.statusCode).toBe(409);
+      expect(optionalBuilderResume.json().error.code).toBe("builder_resume_forbidden");
+
+      const runningParent = (
+        await db
+          .insert(runs)
+          .values({
+            id: newId("run"),
+            orgId,
+            projectId: target.projectId,
+            mode: "analyst",
             engine: "claude_code",
             status: "running",
             engineSessionId: "sess_resume_2",
@@ -7013,8 +7153,7 @@ describe("api", async () => {
             id: newId("run"),
             orgId,
             projectId: target.projectId,
-            agentDefId: target.agent.id,
-            mode: "builder",
+            mode: "analyst",
             engine: "codex",
             status: "succeeded",
             engineSessionId: "sess_codex",
@@ -7030,9 +7169,7 @@ describe("api", async () => {
       expect(codex.statusCode).toBe(409);
       expect(codex.json().error.code).toBe("not_resumable");
 
-      // A resume is a new Builder row, not a second consumption of the
-      // parent's plan acceptance. Required projects therefore deny it before
-      // insertion instead of copying provenance into a non-canonical trigger.
+      // The same Builder guard is independent of project policy.
       await db
         .update(projects)
         .set({ builderPlanPolicy: "required" })
@@ -7044,12 +7181,12 @@ describe("api", async () => {
       const dispatchedBeforeRequiredResume = dispatched.length;
       const governedResume = await app.inject({
         method: "POST",
-        url: `/v1/runs/${parent?.id}/resume`,
+        url: `/v1/runs/${builderParent?.id}/resume`,
         headers: { cookie },
         payload: { message: "attempt a governed resume" },
       });
       expect(governedResume.statusCode, governedResume.body).toBe(409);
-      expect(governedResume.json().error.code).toBe("builder_plan_required");
+      expect(governedResume.json().error.code).toBe("builder_resume_forbidden");
       expect(
         await db.select({ id: runs.id }).from(runs).where(eq(runs.projectId, target.projectId)),
       ).toHaveLength(beforeRequiredResume.length);

@@ -1,12 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { lstatSync, mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
 
 const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const cli = join(pkgRoot, "bin", "facility.mjs");
@@ -582,4 +583,67 @@ test("local commands reject unknown, valueless, and conflicting flags", () => {
     JSON.parse(conflict.stdout).error.message,
     "--local cannot be combined with platform target options",
   );
+});
+
+test("every rendered workflow parses whatever the provision command contains", async (t) => {
+  // A bare `run:` scalar ends at its first ": ", so the no-provision fallback
+  // text — and any command containing ": " — renders a workflow GitHub cannot
+  // parse, and the trigger that workflow carries never runs.
+  const scenarios = [
+    { label: "no provision command detected", setup: false, flags: [], run: /^echo "facility: / },
+    {
+      label: "provision command containing \": \"",
+      setup: true,
+      flags: ['--provision=docker compose up -d && echo "db: ready"'],
+      run: 'docker compose up -d && echo "db: ready"',
+    },
+    { label: "ordinary provision command", setup: true, flags: ["--provision=npm run setup"], run: "npm run setup" },
+  ];
+
+  for (const scenario of scenarios) {
+    const dir = mkdtempSync(join(tmpdir(), "facility-provision-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    execFileSync("git", ["init", "-b", "main"], { cwd: dir });
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify(
+        {
+          name: "demo-app",
+          private: true,
+          // `setup` is what detection proposes as the provision command, so
+          // omitting it is what exercises the fallback.
+          scripts: scenario.setup ? { test: "vitest run", setup: "docker compose up -d" } : { test: "vitest run" },
+        },
+        null,
+        2
+      ) + "\n"
+    );
+    writeFileSync(join(dir, "package-lock.json"), "{}\n");
+
+    const result = runCli(["init", "--yes", `--dir=${dir}`, ...scenario.flags], dir);
+    assert.equal(result.status, 0, `${scenario.label}: ${result.stdout}${result.stderr}`);
+
+    let provisionSteps = 0;
+    for (const entry of readdirSync(join(dir, ".github/workflows"))) {
+      const source = readFileSync(join(dir, ".github/workflows", entry), "utf8");
+      let document;
+      assert.doesNotThrow(() => {
+        document = parseYaml(source);
+      }, `${scenario.label}: ${entry} must parse as YAML`);
+
+      for (const job of Object.values(document.jobs ?? {})) {
+        for (const step of job.steps ?? []) {
+          if (step.name !== "Provision environment") continue;
+          provisionSteps += 1;
+          const run = step.run.trimEnd();
+          if (scenario.run instanceof RegExp) {
+            assert.match(run, scenario.run, `${scenario.label}: ${entry} provision command`);
+          } else {
+            assert.equal(run, scenario.run, `${scenario.label}: ${entry} provision command`);
+          }
+        }
+      }
+    }
+    assert.equal(provisionSteps, 5, `${scenario.label}: every workflow with a provision step must be covered`);
+  }
 });

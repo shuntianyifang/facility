@@ -109,7 +109,8 @@ jobs:
       # The doctor verifies before pushing, so it gets the same provisioned
       # world as the crew.
       - name: Provision environment
-        run: {{PROVISION_CMD}}
+        run: |
+{{PROVISION_RUN}}
 
 {{ANTHROPIC_AUTH_SETUP}}
 

@@ -26,8 +26,8 @@ import {
 import { and, desc, eq } from "drizzle-orm";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { resolveBuilderPlanFreshnessForProposal } from "../src/builder-plan-freshness.js";
 import { buildApp } from "../src/app.js";
+import { resolveBuilderPlanFreshnessForProposal } from "../src/builder-plan-freshness.js";
 import {
   assertBuilderPlanDispatch,
   lockBuilderPlanPolicy,

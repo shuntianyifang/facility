@@ -77,6 +77,17 @@ export async function beginIdempotentRequest(
     );
   }
   if (existing.state !== "completed" || existing.statusCode === null) {
+    // A run-scoped credential can commit domain work while its transport is
+    // disappearing. Never time-reclaim that pending outcome: the matching run
+    // key must remain fail closed until the key/record itself expires.
+    if (principal.runId) {
+      reply.header("retry-after", "1");
+      throw new ApiError(
+        409,
+        "idempotency_in_progress",
+        "A request with this Idempotency-Key is still in progress",
+      );
+    }
     const staleBefore = new Date(Date.now() - IDEMPOTENCY_PENDING_TIMEOUT_MS);
     const reclaimed = await db
       .delete(idempotencyRecords)
@@ -111,27 +122,81 @@ export async function completeIdempotentRequest(
   request: FastifyRequest,
   reply: FastifyReply,
   payload: unknown,
+  options: { completeServerError?: boolean } = {},
 ) {
   const id = request.idempotencyId;
   if (!id) return;
-  try {
-    if (reply.statusCode >= 500) {
+  if (reply.statusCode >= 500) {
+    // A run-scoped handler may have committed before producing its error.
+    // Persist that known response so the sandbox cannot repeat the mutation;
+    // retain the ordinary-user retry behavior outside this trust boundary.
+    if (!options.completeServerError && !request.principal?.runId) {
       await db.delete(idempotencyRecords).where(eq(idempotencyRecords.id, id));
+      request.idempotencyId = undefined;
       return;
     }
-    const responseBody = parsePayload(payload);
-    await db
-      .update(idempotencyRecords)
-      .set({
-        state: "completed",
-        statusCode: reply.statusCode,
-        responseBody,
-        updatedAt: new Date(),
-      })
-      .where(eq(idempotencyRecords.id, id));
-  } catch (error) {
-    request.log.error({ err: error, idempotencyId: id }, "could not persist idempotent response");
   }
+  const responseBody = parsePayload(payload);
+  const completed = await db
+    .update(idempotencyRecords)
+    .set({
+      state: "completed",
+      statusCode: reply.statusCode,
+      responseBody,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(idempotencyRecords.id, id), eq(idempotencyRecords.state, "pending")))
+    .returning({ id: idempotencyRecords.id });
+  if (completed.length !== 1) {
+    throw new Error(`Idempotency record ${id} could not be completed`);
+  }
+  request.idempotencyId = undefined;
+}
+
+/**
+ * A handler committed but its transport disappeared before onSend could
+ * persist the actual response. Seal the key as non-replayable rather than
+ * deleting/reclaiming an outcome that may already have external side effects.
+ */
+export async function finalizeIndeterminateIdempotentRequest(
+  db: FacilityDb,
+  request: FastifyRequest,
+) {
+  const id = request.idempotencyId;
+  if (!id) return;
+  const completed = await db
+    .update(idempotencyRecords)
+    .set({
+      state: "completed",
+      statusCode: 409,
+      responseBody: {
+        error: {
+          code: "idempotency_outcome_indeterminate",
+          message: "The original request may have completed; automatic replay is refused",
+        },
+      },
+      updatedAt: new Date(),
+    })
+    .where(and(eq(idempotencyRecords.id, id), eq(idempotencyRecords.state, "pending")))
+    .returning({ id: idempotencyRecords.id });
+  if (completed.length !== 1) {
+    throw new Error(`Idempotency record ${id} could not be sealed as indeterminate`);
+  }
+  request.idempotencyId = undefined;
+}
+
+/** Remove a pending replay record when its client disconnected before a response. */
+export async function abandonIdempotentRequest(db: FacilityDb, request: FastifyRequest) {
+  const id = request.idempotencyId;
+  if (!id) return;
+  const deleted = await db
+    .delete(idempotencyRecords)
+    .where(and(eq(idempotencyRecords.id, id), eq(idempotencyRecords.state, "pending")))
+    .returning({ id: idempotencyRecords.id });
+  if (deleted.length !== 1) {
+    throw new Error(`Pending idempotency record ${id} could not be abandoned`);
+  }
+  request.idempotencyId = undefined;
 }
 
 export async function expireIdempotencyRecords(db: FacilityDb, now = new Date()) {

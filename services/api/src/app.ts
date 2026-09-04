@@ -30,7 +30,12 @@ import { z } from "zod";
 import { registerAuthorizationServer } from "./auth/authorization-server.js";
 import { readConfig } from "./config.js";
 import { ApiError, sendError } from "./errors.js";
-import { beginIdempotentRequest, completeIdempotentRequest } from "./idempotency.js";
+import {
+  abandonIdempotentRequest,
+  beginIdempotentRequest,
+  completeIdempotentRequest,
+  finalizeIndeterminateIdempotentRequest,
+} from "./idempotency.js";
 import { looksLikeJwt, oauthConfigFromApp, verifyAccessToken } from "./oauth.js";
 import {
   enrichOpenApi,
@@ -43,6 +48,11 @@ import { registerGithubRoutes } from "./routes/github.js";
 import { registerInternalRoutes } from "./routes/internal.js";
 import { registerV1Routes } from "./routes/v1.js";
 import { registerWebhookRoutes } from "./routes/webhooks.js";
+import {
+  acquireExclusiveRunTransitionRequestLease,
+  acquireRunApiKeyRequestLease,
+  acquireSharedRunRequestLease,
+} from "./run-api-key-lease.js";
 import type { AppConfig, Principal } from "./types.js";
 
 const publicRoutes = new Set([
@@ -64,10 +74,27 @@ export async function buildApp(
   });
   const routeRecords: OpenApiRouteRecord[] = [];
   const { db, client } = createDb(config.databaseUrl);
+  // Session advisory locks intentionally outlive individual SQL statements.
+  // Keep them on a small dedicated pool so slow run-key requests can never
+  // consume the application's query pool and deadlock their own handlers.
+  const { client: runRequestLeaseClient } = createDb(config.databaseUrl, { max: 4 });
+  // Writers need a distinct pool: if every shared slot is held by a long
+  // callback, an exclusive transition must still connect and wait on the
+  // advisory lock instead of starving behind the pool's FIFO queue.
+  const { db: runTransitionDb, client: runTransitionLeaseClient } = createDb(config.databaseUrl, {
+    max: 2,
+  });
   app.decorate("facilityDb", db);
   app.decorate("githubClientFactory", undefined);
   app.decorate("githubInstallationTokenFactory", undefined);
   app.decorate("githubAppMetadataReader", undefined);
+  app.decorate("runTransitionDb", runTransitionDb);
+  app.decorate("acquireRunTransitionLease", (runId: string) =>
+    acquireExclusiveRunTransitionRequestLease(runTransitionLeaseClient, runId),
+  );
+  app.decorate("acquireRunRequestLease", (runId: string) =>
+    acquireSharedRunRequestLease(runRequestLeaseClient, runId),
+  );
 
   // Producer-only pg-boss handle: routes enqueue, the worker consumes.
   const boss = new PgBoss({ connectionString: config.databaseUrl });
@@ -184,6 +211,15 @@ export async function buildApp(
   app.decorateRequest("principal", undefined);
   app.decorateRequest("idempotencyId", undefined);
   app.decorateRequest("idempotencyReplayed", false);
+  app.decorateRequest("releasePlatformRunRequestLease", undefined);
+  app.decorateRequest("releaseRunnerRunRequestLease", undefined);
+  app.decorateRequest("releaseRunTransitionLease", undefined);
+  app.decorateRequest("runRequestOperationCount", 0);
+  app.decorateRequest("runRequestAborted", false);
+  app.decorateRequest("runRequestAbortReleaseDeferred", false);
+  app.decorateRequest("runRequestAbortCleanupPromise", undefined);
+  app.decorateRequest("runRequestHandlerStarted", false);
+  app.decorateRequest("runRequestHandlerSettled", false);
   app.decorateRequest(
     "audit",
     async function audit(this: FastifyRequest, action: string, target, payload = {}) {
@@ -255,6 +291,17 @@ export async function buildApp(
       }
     }
     const allowedPermissions = Array.isArray(permission) ? permission : [permission];
+    // A sandbox platform key must never enter a terminal/retry route while it
+    // holds this run's shared request lease. Besides exceeding its purpose,
+    // self-cancel would wait on its own shared lock and cross-cancel could form
+    // an A->B / B->A deadlock. Runner lifecycle uses the separate frt_ channel.
+    if (request.principal.runId && request.routeOptions.config?.runLifecycle === true) {
+      throw new ApiError(
+        403,
+        "run_key_lifecycle_forbidden",
+        "Run-scoped platform keys cannot control run lifecycle",
+      );
+    }
     if (
       !allowedPermissions.some((candidate) => can(request.principal?.permissions ?? [], candidate))
     ) {
@@ -264,33 +311,222 @@ export async function buildApp(
     }
   });
 
+  const releasePlatformRunRequestLease = async (request: FastifyRequest) => {
+    const release = request.releasePlatformRunRequestLease;
+    request.releasePlatformRunRequestLease = undefined;
+    if (release) await release();
+  };
+
+  const releaseRunnerRunRequestLease = async (request: FastifyRequest) => {
+    const release = request.releaseRunnerRunRequestLease;
+    request.releaseRunnerRunRequestLease = undefined;
+    if (release) await release();
+  };
+
+  const releaseRunTransitionLease = async (request: FastifyRequest) => {
+    const release = request.releaseRunTransitionLease;
+    request.releaseRunTransitionLease = undefined;
+    if (release) await release();
+  };
+
+  const releaseAllRunRequestLeases = async (request: FastifyRequest) => {
+    await Promise.all([
+      releasePlatformRunRequestLease(request),
+      releaseRunnerRunRequestLease(request),
+      releaseRunTransitionLease(request),
+    ]);
+  };
+
+  const releaseAbortedIdleRunRequest = async (request: FastifyRequest) => {
+    if (!request.runRequestAborted || (request.runRequestOperationCount ?? 0) !== 0) return;
+    if (request.runRequestAbortCleanupPromise) {
+      await request.runRequestAbortCleanupPromise;
+      return;
+    }
+    // Raw socket close and handler settlement can observe the same idle
+    // request. Single-flight the durable idempotency transition so neither can
+    // release the advisory lease while the other is still sealing the row.
+    const cleanup = (async () => {
+      if (!request.runRequestAborted || (request.runRequestOperationCount ?? 0) !== 0) return;
+      if (request.runRequestHandlerStarted && !request.runRequestHandlerSettled) return;
+      if (request.runRequestAbortReleaseDeferred || request.idempotencyId) {
+        if (request.runRequestHandlerStarted) {
+          await finalizeIndeterminateIdempotentRequest(db, request);
+        } else {
+          await abandonIdempotentRequest(db, request);
+        }
+      }
+      request.runRequestAbortReleaseDeferred = false;
+      await releaseAllRunRequestLeases(request);
+    })();
+    request.runRequestAbortCleanupPromise = cleanup;
+    try {
+      await cleanup;
+    } finally {
+      if (request.runRequestAbortCleanupPromise === cleanup) {
+        request.runRequestAbortCleanupPromise = undefined;
+      }
+    }
+  };
+
+  // An aborted socket does not cancel JavaScript work. Count every pre-handler,
+  // handler, and response hook that can still mutate state; an abort releases
+  // leases only after the last such operation settles. Successful requests keep
+  // their lease until onResponse, including one-shot credential delivery.
+  app.decorate("beginRunRequestOperation", (request: FastifyRequest) => {
+    request.runRequestOperationCount = (request.runRequestOperationCount ?? 0) + 1;
+    let ended = false;
+    return async () => {
+      if (ended) return;
+      ended = true;
+      request.runRequestOperationCount = Math.max(0, (request.runRequestOperationCount ?? 1) - 1);
+      await releaseAbortedIdleRunRequest(request);
+    };
+  });
+
+  app.addHook("onRoute", (route) => {
+    const handler = route.handler;
+    route.handler = async function runRequestLeaseHandler(request, reply) {
+      const endOperation = app.beginRunRequestOperation(request);
+      try {
+        if (request.runRequestAborted || request.raw.aborted) {
+          request.runRequestAborted = true;
+          throw new ApiError(409, "request_aborted", "Request was aborted before execution");
+        }
+        request.runRequestHandlerStarted = true;
+        return await handler.call(this, request, reply);
+      } finally {
+        request.runRequestHandlerSettled = true;
+        await endOperation();
+      }
+    };
+  });
+
+  app.addHook("onTimeout", async (request) => {
+    request.runRequestAborted = true;
+    await releaseAbortedIdleRunRequest(request);
+  });
+  app.addHook("onRequestAbort", async (request) => {
+    request.runRequestAborted = true;
+    await releaseAbortedIdleRunRequest(request);
+  });
+
+  // onRequestAbort covers an incomplete inbound body. A client may also send
+  // its full mutation and disconnect while a pre-handler or onSend barrier is
+  // waiting; Node does not mark IncomingMessage.aborted in that case. Observe
+  // the response socket as well so request-lifetime advisory locks cannot leak.
+  app.addHook("onRequest", async (request, reply) => {
+    reply.raw.once("close", () => {
+      if (reply.raw.writableFinished) return;
+      request.runRequestAborted = true;
+      void releaseAbortedIdleRunRequest(request).catch((error) => {
+        request.log.error({ err: error }, "failed to release aborted run request lease");
+      });
+    });
+  });
+
   app.addHook("preHandler", async (request, reply) => {
-    return beginIdempotentRequest(db, request, reply);
+    const endOperation = app.beginRunRequestOperation(request);
+    try {
+      if (request.runRequestAborted || request.raw.aborted) {
+        request.runRequestAborted = true;
+        throw new ApiError(409, "request_aborted", "Request was aborted before execution");
+      }
+      const principal = request.principal;
+      if (
+        reply.sent ||
+        !principal?.runId ||
+        ["GET", "HEAD", "OPTIONS"].includes(request.method.toUpperCase())
+      ) {
+        return;
+      }
+      request.releasePlatformRunRequestLease = await acquireRunApiKeyRequestLease(
+        runRequestLeaseClient,
+        {
+          keyId: principal.id,
+          runId: principal.runId,
+          orgId: principal.orgId,
+          projectId: principal.projectId,
+        },
+      );
+      if (request.raw.aborted) {
+        request.runRequestAborted = true;
+        throw new ApiError(409, "request_aborted", "Request was aborted before execution");
+      }
+    } finally {
+      await endOperation();
+    }
+  });
+
+  // Acquire and revalidate before idempotency replay. Otherwise a revoked
+  // run-scoped key could receive a cached success (and mutate the replay row)
+  // after a terminal transition had already won the exclusive lease.
+  app.addHook("preHandler", async (request, reply) => {
+    const endOperation = app.beginRunRequestOperation(request);
+    try {
+      if (request.runRequestAborted || request.raw.aborted) {
+        request.runRequestAborted = true;
+        throw new ApiError(409, "request_aborted", "Request was aborted before execution");
+      }
+      const result = await beginIdempotentRequest(db, request, reply);
+      if (request.idempotencyId) request.runRequestAbortReleaseDeferred = true;
+      if (request.runRequestAborted || request.raw.aborted) {
+        request.runRequestAborted = true;
+        throw new ApiError(409, "request_aborted", "Request was aborted before execution");
+      }
+      return result;
+    } finally {
+      await endOperation();
+    }
   });
 
   app.addHook("onSend", async (request, reply, payload) => {
-    await completeIdempotentRequest(db, request, reply, payload);
-    return payload;
+    const endOperation = app.beginRunRequestOperation(request);
+    try {
+      // If the transport disappeared before this hook started, the cleanup
+      // owns the idempotency outcome. Await it rather than racing a 409 seal
+      // with persistence of a response the client can no longer receive.
+      await request.runRequestAbortCleanupPromise;
+      if ((request.runRequestAborted || request.raw.aborted) && !request.runRequestHandlerStarted) {
+        request.runRequestAborted = true;
+        await abandonIdempotentRequest(db, request);
+      } else {
+        await completeIdempotentRequest(db, request, reply, payload, {
+          completeServerError: request.runRequestAborted === true,
+        });
+      }
+      return payload;
+    } finally {
+      request.runRequestAbortReleaseDeferred = Boolean(request.idempotencyId);
+      await endOperation();
+    }
   });
 
   app.addHook("onResponse", async (request, reply) => {
-    const permission = request.routeOptions.config?.permission;
-    const action = request.routeOptions.config?.auditAction as string | undefined;
-    if (
-      !permission ||
-      request.idempotencyReplayed ||
-      request.method === "GET" ||
-      reply.statusCode < 200 ||
-      reply.statusCode >= 300 ||
-      !action
-    ) {
-      return;
+    const endOperation = app.beginRunRequestOperation(request);
+    try {
+      if (request.runRequestAborted || request.raw.aborted) return;
+      const permission = request.routeOptions.config?.permission;
+      const action = request.routeOptions.config?.auditAction as string | undefined;
+      if (
+        !permission ||
+        request.idempotencyReplayed ||
+        request.method === "GET" ||
+        reply.statusCode < 200 ||
+        reply.statusCode >= 300 ||
+        !action
+      ) {
+        return;
+      }
+      const params = request.params as Record<string, string | undefined>;
+      await request.audit(action, {
+        type: params.projectId ? "project" : "route",
+        id: params.projectId ?? request.url,
+      });
+    } finally {
+      await endOperation();
+      await releaseAllRunRequestLeases(request);
     }
-    const params = request.params as Record<string, string | undefined>;
-    await request.audit(action, {
-      type: params.projectId ? "project" : "route",
-      id: params.projectId ?? request.url,
-    });
   });
 
   const healthOptions = {
@@ -360,6 +596,10 @@ export async function buildApp(
 
   app.addHook("onClose", async () => {
     if (bossStarted) await boss.stop({ close: true });
+    // Stop shared request holders before closing the pool used by exclusive
+    // transitions that may be waiting on them.
+    await runRequestLeaseClient.end({ timeout: 1 });
+    await runTransitionLeaseClient.end({ timeout: 1 });
     await client.end();
   });
 
@@ -404,6 +644,7 @@ async function resolvePrincipal(
           id: row.key.id,
           orgId: row.key.orgId,
           projectId: row.key.projectId,
+          runId: row.key.runId,
           permissions: row.role.permissions,
         };
       }

@@ -30,6 +30,7 @@ import {
   engineResultError,
   exitCode,
   githubRequest,
+  githubWorkflowWriteRequired,
   gitOutput,
   handleControlMessage,
   parseGitNameStatus,
@@ -44,6 +45,8 @@ import {
   readAgentUpdateMetadata,
   readOnlyEngineProgress,
   readSecurityReport,
+  repositoryWriteTokenRequest,
+  repositoryWriteTrackingVersionFromHello,
   requiresAgentProgress,
   restoreWorkspaceCheckpoint,
   resumeContinuationPrompt,
@@ -793,7 +796,8 @@ describe("workspace preparation", () => {
       publishVerifiedGithubChanges({
         repo: "acme/widget",
         token: "installation-token",
-        requestedBranch: "feature/task",
+        authorizedBranch: "feature/task",
+        branchReserved: true,
         baseSha: "base_sha",
         commitMessage:
           "feat!: deliver task\n\nExplain the migration.\n\nBREAKING CHANGE: use the new task API",
@@ -802,7 +806,7 @@ describe("workspace preparation", () => {
         fetchImpl,
       }),
     ).resolves.toEqual({ branch: "feature/task", headSha: "signed_sha" });
-    const mutation = JSON.parse(String(requests[2]?.init?.body));
+    const mutation = JSON.parse(String(requests[1]?.init?.body));
     expect(mutation.variables.input.message).toEqual({
       headline: "feat!: deliver task",
       body: "Delivered by Facility run run_12345678.\n\nExplain the migration.\n\nBREAKING CHANGE: use the new task API",
@@ -811,9 +815,67 @@ describe("workspace preparation", () => {
       path: "src/task.js",
       contents: "Y29udGVudA==",
     });
-    expect(requests[1]?.init?.headers).toMatchObject({
+    expect(requests[0]?.init?.headers).toMatchObject({
       authorization: "Bearer installation-token",
     });
+    expect(requests).toHaveLength(2);
+  });
+
+  it("negotiates tracked push evidence and keeps the legacy availability probe", async () => {
+    expect(repositoryWriteTrackingVersionFromHello(undefined)).toBe(0);
+    expect(repositoryWriteTrackingVersionFromHello(0)).toBe(0);
+    expect(repositoryWriteTrackingVersionFromHello(1)).toBe(1);
+    expect(repositoryWriteTokenRequest(0, true, "feature/task", "a".repeat(40))).toEqual({
+      workflowWrite: true,
+    });
+    expect(repositoryWriteTokenRequest(1, false, "feature/task", "a".repeat(40))).toEqual({
+      workflowWrite: false,
+      requestedBranch: "feature/task",
+      baseSha: "a".repeat(40),
+    });
+
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = String(input);
+      requests.push({ url, init });
+      if (!init?.method || init.method === "GET") {
+        const exists = url.endsWith("/feature/task");
+        return new Response(JSON.stringify({ message: exists ? "exists" : "Not Found" }), {
+          status: exists ? 200 : 404,
+        });
+      }
+      if (init?.method === "POST" && url.endsWith("/git/refs")) {
+        return new Response(JSON.stringify({ ref: "refs/heads/feature/task-12345678" }), {
+          status: 201,
+        });
+      }
+      if (url.endsWith("/graphql")) {
+        return new Response(
+          JSON.stringify({ data: { createCommitOnBranch: { commit: { oid: "legacy_sha" } } } }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ message: "unexpected" }), { status: 500 });
+    };
+    await expect(
+      publishVerifiedGithubChanges({
+        repo: "acme/widget",
+        token: "legacy-token",
+        authorizedBranch: "feature/task",
+        branchReserved: false,
+        baseSha: "base_sha",
+        commitMessage: "fix: deliver legacy task",
+        changes: [{ kind: "addition", path: "task.js", contents: "YQ==" }],
+        runId: "run_12345678",
+        fetchImpl,
+      }),
+    ).resolves.toEqual({ branch: "feature/task-12345678", headSha: "legacy_sha" });
+    expect(
+      requests
+        .slice(0, 2)
+        .every((request) => !request.init?.method || request.init.method === "GET"),
+    ).toBe(true);
+    expect(requests[2]?.init?.method).toBe("POST");
   });
 
   it("fails before publishing when a Conventional Commit prefix cannot fit GitHub", async () => {
@@ -827,7 +889,7 @@ describe("workspace preparation", () => {
       publishVerifiedGithubChanges({
         repo: "acme/widget",
         token: "installation-token",
-        requestedBranch: "feature/task",
+        authorizedBranch: "feature/task",
         baseSha: "base_sha",
         commitMessage: `feat(${"a".repeat(112)}): x`,
         changes: [{ kind: "addition", path: "src/task.js", contents: "Y29udGVudA==" }],
@@ -927,6 +989,42 @@ describe("workspace preparation", () => {
     ]);
     expect(semanticDeliveryBranch("feature/2-subtract", "main")).toBe("feature/2-subtract");
     expect(() => semanticDeliveryBranch("main", "main")).toThrow("branch_not_semantic");
+  });
+
+  describe("GitHub workflow publication capability", () => {
+    it.each([
+      ["source file", [{ kind: "addition", path: "src/index.ts" }], false],
+      ["workflow addition", [{ kind: "addition", path: ".github/workflows/ci.yml" }], true],
+      [
+        "workflow modification",
+        [{ kind: "addition", path: ".github/workflows/release.yml" }],
+        true,
+      ],
+      ["workflow deletion", [{ kind: "deletion", path: ".github/workflows/old.yml" }], true],
+      [
+        "nested workflow path",
+        [{ kind: "addition", path: ".github/workflows/generated/security.yml" }],
+        true,
+      ],
+      [
+        "workflow-like directory",
+        [{ kind: "addition", path: ".github/workflows-not/ci.yml" }],
+        false,
+      ],
+      ["workflow-like file", [{ kind: "addition", path: ".github/workflows.yml" }], false],
+      ["case variant", [{ kind: "addition", path: ".github/Workflows/ci.yml" }], false],
+    ] as const)("classifies a %s", (_name, changes, expected) => {
+      expect(githubWorkflowWriteRequired(changes)).toBe(expected);
+    });
+
+    it("finds a workflow in a large mixed final change set", () => {
+      const changes = Array.from({ length: 10_000 }, (_, index) => ({
+        path: `src/generated/${index}.ts`,
+      }));
+      changes.push({ path: ".github/workflows/preview.yml" });
+
+      expect(githubWorkflowWriteRequired(changes)).toBe(true);
+    });
   });
 
   it("accepts minimal agent-owned metadata for an existing PR update", async () => {

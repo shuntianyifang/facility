@@ -33,7 +33,7 @@ import {
   webhookDeliveries,
 } from "@facility/db";
 import { artifactIdFor, validate, wsjfValueSection } from "@facility/harness";
-import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import { assertBudgetAgentInProject, resolveBudgetScope } from "./budget-scope.js";
 import {
   type BuilderPlanFreshnessOptions,
@@ -41,6 +41,7 @@ import {
 } from "./builder-plan-freshness.js";
 import {
   architectRunIdentityValid,
+  assertGenericRunResumeAllowed,
   builderPlanDenialCode,
   builderPlanRequired,
   lockBuilderPlanPolicy,
@@ -74,8 +75,9 @@ import {
 } from "./harness.js";
 import { MCP_TOOL_PERMISSIONS } from "./mcp-policy.js";
 import { createNextDraftVersion, publishRegistryVersion } from "./registry.js";
-import { cancelRun } from "./sandbox/orchestrator.js";
-import { appendRunEvents, TERMINAL_RUN_STATUSES } from "./sandbox/state.js";
+import { acquireExclusiveRunTransitionTransactionLease } from "./run-api-key-lease.js";
+import { cancelRun, revokeRunKeys } from "./sandbox/orchestrator.js";
+import { appendRunEvents, readSandbox, TERMINAL_RUN_STATUSES } from "./sandbox/state.js";
 import { validateScheduleTrigger } from "./schedules.js";
 import type { AppConfig } from "./types.js";
 
@@ -98,6 +100,7 @@ export type GitHubIssueClient = {
 
 type ExecuteApprovedProposalOptions = {
   config?: AppConfig;
+  transitionDb?: FacilityDb;
   github?: GitHubIssueClient;
   githubFactory?: GithubClientFactory;
   githubClient?: BuilderPlanFreshnessOptions["githubClient"];
@@ -625,6 +628,7 @@ export async function loadPlanBuilderRun(db: Db, proposal: typeof proposals.$inf
           eq(runs.orgId, proposal.orgId),
           eq(runs.projectId, proposal.projectId ?? ""),
           inArray(runs.mode, ["builder", "codex-builder"]),
+          isNull(runs.retryOfRunId),
           sql`${runs.trigger} @> ${JSON.stringify({
             source: "plan_acceptance",
             proposalId: proposal.id,
@@ -646,6 +650,7 @@ async function loadArchitectBuilderRun(db: Db, proposal: typeof proposals.$infer
           eq(runs.orgId, proposal.orgId),
           eq(runs.projectId, proposal.projectId ?? ""),
           inArray(runs.mode, ["builder", "codex-builder"]),
+          isNull(runs.retryOfRunId),
           sql`${runs.trigger} @> ${JSON.stringify({
             source: "plan_acceptance",
             architectRunId: proposal.runId,
@@ -760,22 +765,31 @@ async function assertMcpRequesterStillAuthorized(
   if (requesterType === "key") {
     const key = (
       await db
-        .select({ permissions: roles.permissions, projectId: apiKeys.projectId })
+        .select({
+          permissions: roles.permissions,
+          projectId: apiKeys.projectId,
+          runId: apiKeys.runId,
+          revokedAt: apiKeys.revokedAt,
+          expiresAt: apiKeys.expiresAt,
+        })
         .from(apiKeys)
         .innerJoin(roles, eq(apiKeys.roleId, roles.id))
-        .where(
-          and(
-            eq(apiKeys.orgId, orgId),
-            eq(apiKeys.id, requesterId),
-            isNull(apiKeys.revokedAt),
-            or(isNull(apiKeys.expiresAt), gt(apiKeys.expiresAt, new Date())),
-          ),
-        )
+        .where(and(eq(apiKeys.orgId, orgId), eq(apiKeys.id, requesterId)))
         .limit(1)
     )[0];
+    // Also fence proposals created before the admission guard above existed.
+    // Restoring this capability requires executor-lifetime run leasing; a
+    // revoked/active snapshot check alone cannot close the deferred TOCTOU.
+    if (key?.runId) {
+      throw new Error("run_key_deferred_mcp_forbidden");
+    }
+    const activeKey =
+      key && key.revokedAt === null && (key.expiresAt === null || key.expiresAt > new Date())
+        ? key
+        : undefined;
     assertCurrentMcpAuthority(
-      key?.permissions,
-      key?.projectId ?? null,
+      activeKey?.permissions,
+      activeKey?.projectId ?? null,
       expectedPermission,
       targetProjectId,
     );
@@ -906,19 +920,25 @@ async function executeKnownMcpTool(
   if (toolName === "facility_cancel_run") {
     const runId = requiredString(args.runId, "runId");
     // Guard the transition so a terminal run isn't reopened to "canceled".
-    const row = (
-      await db
-        .update(runs)
-        .set({ status: "canceled", endedAt: new Date(), updatedAt: new Date() })
-        .where(
-          and(
-            eq(runs.orgId, orgId),
-            eq(runs.id, runId),
-            notInArray(runs.status, [...TERMINAL_RUN_STATUSES]),
-          ),
-        )
-        .returning()
-    )[0];
+    const row = await (options.transitionDb ?? db).transaction(async (transaction) => {
+      const tx = transaction as unknown as FacilityDb;
+      await acquireExclusiveRunTransitionTransactionLease(tx, runId);
+      const row = (
+        await tx
+          .update(runs)
+          .set({ status: "canceled", endedAt: new Date(), updatedAt: new Date() })
+          .where(
+            and(
+              eq(runs.orgId, orgId),
+              eq(runs.id, runId),
+              notInArray(runs.status, [...TERMINAL_RUN_STATUSES]),
+            ),
+          )
+          .returning()
+      )[0];
+      if (row) await revokeRunKeys(tx, readSandbox(row.sandbox));
+      return row;
+    });
     if (!row) {
       const current = (
         await db
@@ -1015,6 +1035,7 @@ async function executeKnownMcpTool(
         .limit(1)
     )[0];
     if (!parent) throw new Error("run_not_found");
+    await assertGenericRunResumeAllowed(db, parent);
     if (!TERMINAL_RUN_STATUSES.includes(parent.status as (typeof TERMINAL_RUN_STATUSES)[number])) {
       throw new Error("run_not_terminal");
     }
@@ -1159,6 +1180,22 @@ async function executeKnownMcpTool(
             .returning()
         )[0];
         if (!conversation) throw new Error("conversation_turn_in_flight");
+        if (conversation.engineSessionId && conversation.lastRunId) {
+          const parent = (
+            await tx
+              .select()
+              .from(runs)
+              .where(
+                and(
+                  eq(runs.orgId, conversation.orgId),
+                  eq(runs.projectId, conversation.projectId),
+                  eq(runs.id, conversation.lastRunId),
+                ),
+              )
+              .limit(1)
+          )[0];
+          if (parent) await assertGenericRunResumeAllowed(tx, parent);
+        }
         const rows = await tx
           .select({ max: sql<number>`coalesce(max(${conversationMessages.seq}), 0)` })
           .from(conversationMessages)

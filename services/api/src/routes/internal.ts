@@ -1,5 +1,13 @@
 import { open, verifyKey } from "@facility/core";
-import { githubInstallations, insertAuditEvent, repos, runs, steerMessages } from "@facility/db";
+import {
+  type FacilityDb,
+  githubInstallations,
+  insertAuditEvent,
+  repos,
+  runs,
+  steerMessages,
+} from "@facility/db";
+import { isBuilderMode } from "@facility/run-objective";
 import { and, asc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
@@ -12,8 +20,15 @@ import { ApiError, notFound } from "../errors.js";
 import {
   createGithubClientFactory,
   createGithubInstallationTokenFactory,
+  FacilityGithubClient,
+  type GithubInstallationTokenFactory,
 } from "../github/client.js";
 import { collectGithubSecuritySweepEvidence } from "../github/security-sweep.js";
+import {
+  markRepositoryWriteLeaseIssued,
+  reserveRepositoryWriteLease,
+  selectAvailableRepositoryWriteBranch,
+} from "../repository-write-lease.js";
 import { finishRun, updateGithubRunProgress } from "../sandbox/orchestrator.js";
 import {
   appendRunEvents,
@@ -25,6 +40,16 @@ import type { AppConfig } from "../types.js";
 
 const Params = z.object({ runId: z.string() });
 const GitCommitSha = z.string().regex(/^[0-9a-f]{40}$/i);
+const TrackedPushTokenRequest = z
+  .object({
+    workflowWrite: z.boolean().optional(),
+    requestedBranch: z.string().min(1).max(255),
+    baseSha: GitCommitSha,
+  })
+  .strict();
+const PushTokenRequest = z
+  .union([TrackedPushTokenRequest, z.object({ workflowWrite: z.boolean().optional() }).strict()])
+  .nullish();
 const TRANSCRIPT_MAX_BYTES = 50 * 1024 * 1024;
 const SESSION_STATE_MAX_BYTES = 200 * 1024 * 1024;
 const EventBatch = z.array(
@@ -71,12 +96,72 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
     (request as RunnerRequest).runnerRun = run;
   }
 
+  async function leaseRunnerMutation(request: FastifyRequest) {
+    const endOperation = app.beginRunRequestOperation(request);
+    const snapshot = (request as RunnerRequest).runnerRun;
+    try {
+      if (!snapshot) throw notFound("Run not found");
+      const snapshotSandbox = readSandbox(snapshot.sandbox);
+      if (!snapshotSandbox.runnerTokenHash) {
+        throw new ApiError(401, "unauthorized", "Runner token required");
+      }
+      const release = await app.acquireRunRequestLease(snapshot.id);
+      request.releaseRunnerRunRequestLease = release;
+      if (request.runRequestAborted || request.raw.aborted) {
+        request.runRequestAborted = true;
+        throw new ApiError(409, "request_aborted", "Request was aborted before execution");
+      }
+      const current = (
+        await db
+          .select()
+          .from(runs)
+          .where(
+            and(
+              eq(runs.id, snapshot.id),
+              eq(runs.orgId, snapshot.orgId),
+              eq(runs.projectId, snapshot.projectId),
+              eq(runs.status, "running"),
+            ),
+          )
+          .limit(1)
+      )[0];
+      const sandbox = current ? readSandbox(current.sandbox) : null;
+      if (
+        !current ||
+        !sandbox?.runnerTokenHash ||
+        sandbox.runnerTokenHash !== snapshotSandbox.runnerTokenHash
+      ) {
+        throw new ApiError(
+          409,
+          "runner_callback_inactive",
+          "Runner callback is no longer attached to an active run",
+        );
+      }
+      if (request.runRequestAborted || request.raw.aborted) {
+        request.runRequestAborted = true;
+        throw new ApiError(409, "request_aborted", "Request was aborted before execution");
+      }
+      (request as RunnerRequest).runnerRun = current;
+    } finally {
+      await endOperation();
+    }
+  }
+
   app.post(
     "/internal/runs/:runId/hello",
     {
       config: { public: true },
       preHandler: authenticate,
-      schema: { params: Params, response: { 200: z.record(z.string(), z.unknown()) } },
+      schema: {
+        params: Params,
+        // Optional for a rolling upgrade: old runners remain usable, but their
+        // runs retain tracking version 0 and therefore fail closed for retry.
+        body: z
+          .object({ repositoryWriteTrackingVersion: z.literal(1) })
+          .strict()
+          .nullish(),
+        response: { 200: z.record(z.string(), z.unknown()) },
+      },
     },
     async (request) => {
       const run = (request as RunnerRequest).runnerRun;
@@ -91,6 +176,13 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
       const securitySweepEvidence = isSecuritySweepMode(run.mode)
         ? await securitySweepEvidenceForRun(run, sandbox)
         : null;
+      const repositoryWriteTrackingVersion = (
+        request.body as { repositoryWriteTrackingVersion?: number } | null | undefined
+      )?.repositoryWriteTrackingVersion;
+      const acceptedRepositoryWriteTrackingVersion =
+        config.repositoryWriteTrackingPromotionEnabled && repositoryWriteTrackingVersion === 1
+          ? 1
+          : 0;
       const virtualKeyRevealedAt = new Date().toISOString();
       // Claim the transition to running only if the run is still active. A cancel
       // that lands between the auth snapshot and here must win — we must not
@@ -101,6 +193,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
         .set({
           status: "running",
           startedAt: run.startedAt ?? new Date(),
+          repositoryWriteTrackingVersion: acceptedRepositoryWriteTrackingVersion,
           // launch() and /hello race on fast providers. Merge only the field
           // owned by this endpoint so a provider ref attached after the auth
           // snapshot cannot be erased by this one-shot credential claim.
@@ -116,6 +209,11 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
           "Run credentials are no longer available",
         );
       }
+      // /hello is the sole provisioning -> running handshake. Take the shared
+      // callback lease only after that CAS, then revalidate under it before any
+      // one-shot credential is revealed. A concurrent cancel either waits for
+      // the response or wins first and makes this fail closed.
+      await leaseRunnerMutation(request);
       await appendRunEvents(db, run.orgId, run.id, [{ type: "hello", data: {} }]);
       await updateGithubRunProgress(db, run.id, "running", {
         config,
@@ -136,7 +234,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
         // Short-lived clone credential for private repos. In production this is
         // a per-run GitHub App installation token; here it falls back to a
         // configured token for self-host / validation.
-        repoToken: await repoTokenForRun(sandbox),
+        repoToken: await repoTokenForRun(run, sandbox),
         // Released through the same one-shot authenticated handshake as the
         // virtual and clone keys, and only when this run has a dedicated
         // dependency-install phase. The sandbox task itself has no IAM access
@@ -146,6 +244,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
           : null,
         securitySweepEvidence,
         gatewayUrls: sandbox.bundle.gatewayUrls,
+        repositoryWriteTrackingVersion: acceptedRepositoryWriteTrackingVersion,
       };
     },
   );
@@ -173,7 +272,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
     "/internal/runs/:runId/workspace",
     {
       config: { public: true },
-      preHandler: authenticate,
+      preHandler: [authenticate, leaseRunnerMutation],
       schema: {
         params: Params,
         body: z.object({ baseSha: GitCommitSha }),
@@ -212,7 +311,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
     "/internal/runs/:runId/events",
     {
       config: { public: true },
-      preHandler: authenticate,
+      preHandler: [authenticate, leaseRunnerMutation],
       schema: {
         params: Params,
         body: EventBatch,
@@ -262,6 +361,9 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
     "/internal/runs/:runId/steer",
     {
       config: { public: true },
+      // Polling is read-only and may wait for 25 seconds. Acquire the shared
+      // run lease only once there is a message to claim, so long polls cannot
+      // exhaust the callback lease pool.
       preHandler: authenticate,
       schema: {
         params: Params,
@@ -284,19 +386,25 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
           .orderBy(asc(steerMessages.createdAt))
           .limit(10);
         if (messages.length > 0) {
-          await db
+          await leaseRunnerMutation(request);
+          const activeRun = (request as RunnerRequest).runnerRun;
+          if (!activeRun) throw notFound("Run not found");
+          const claimed = await db
             .update(steerMessages)
             .set({ deliveredAt: new Date() })
             .where(
               and(
-                eq(steerMessages.runId, run.id),
+                eq(steerMessages.runId, activeRun.id),
+                isNull(steerMessages.deliveredAt),
                 inArray(
                   steerMessages.id,
                   messages.map((message) => message.id),
                 ),
               ),
-            );
-          return messages;
+            )
+            .returning();
+          const claimedIds = new Set(claimed.map((message) => message.id));
+          return messages.filter((message) => claimedIds.has(message.id));
         }
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
@@ -311,44 +419,223 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
       preHandler: authenticate,
       schema: {
         params: Params,
-        response: { 200: z.object({ token: z.string() }) },
+        body: PushTokenRequest,
+        response: {
+          200: z.object({
+            token: z.string(),
+            authorizedBranch: z.string().min(1).max(255).nullable(),
+          }),
+        },
       },
     },
     async (request) => {
-      const run = (request as RunnerRequest).runnerRun;
-      if (!run) throw notFound("Run not found");
-      const sandbox = readSandbox(run.sandbox);
-      const repoRef = await repoForRun(run, sandbox);
-      if (!repoRef?.installationId) {
-        throw new ApiError(409, "no_installation", "Run repository has no GitHub installation");
+      const authenticatedRun = (request as RunnerRequest).runnerRun;
+      if (!authenticatedRun) throw notFound("Run not found");
+      const authenticatedSandbox = readSandbox(authenticatedRun.sandbox);
+      if (!authenticatedSandbox.runnerTokenHash) {
+        throw new ApiError(401, "unauthorized", "Runner token required");
       }
-      const installation = (
-        await db
-          .select()
-          .from(githubInstallations)
-          .where(eq(githubInstallations.id, repoRef.installationId))
-          .limit(1)
-      )[0];
-      if (!installation) {
-        throw new ApiError(409, "no_installation", "Run repository has no GitHub installation");
+      const body = (request.body ?? {}) as NonNullable<z.infer<typeof PushTokenRequest>>;
+      const releaseTransitionLease = await app.acquireRunTransitionLease(authenticatedRun.id);
+      request.releaseRunTransitionLease = releaseTransitionLease;
+      if (request.runRequestAborted || request.raw.aborted) {
+        request.runRequestAborted = true;
+        throw new ApiError(409, "request_aborted", "Request was aborted before execution");
       }
+      const loadIssuanceContext = async (database: FacilityDb) => {
+        const run = (
+          await database
+            .select()
+            .from(runs)
+            .where(
+              and(
+                eq(runs.id, authenticatedRun.id),
+                eq(runs.orgId, authenticatedRun.orgId),
+                eq(runs.projectId, authenticatedRun.projectId),
+              ),
+            )
+            .limit(1)
+        )[0];
+        if (run?.status !== "running") {
+          throw new ApiError(409, "run_terminal", "Run is not active for repository writes");
+        }
+        const sandbox = readSandbox(run.sandbox);
+        if (sandbox.runnerTokenHash !== authenticatedSandbox.runnerTokenHash) {
+          throw new ApiError(409, "runner_callback_inactive", "Runner credential changed");
+        }
+        if (!isBuilderMode(run.mode) && !repairRepositoryMode(run.mode)) {
+          throw new ApiError(
+            409,
+            "repository_write_mode_forbidden",
+            "Run mode is not allowed to request repository write credentials",
+          );
+        }
+        const repoRef = await repoForRun(run, sandbox, database);
+        if (!repoRef?.installationId) {
+          throw new ApiError(409, "no_installation", "Run repository has no GitHub installation");
+        }
+        if (run.repositoryWriteTrackingVersion === 1) {
+          if (!isTrackedPushTokenRequest(body)) {
+            throw new ApiError(
+              409,
+              "repository_write_tracking_required",
+              "Tracked runner omitted its durable repository write intent",
+            );
+          }
+          assertRepositoryWriteIntent(run, sandbox, body.requestedBranch, body.baseSha);
+        }
+        const installation = (
+          await database
+            .select()
+            .from(githubInstallations)
+            .where(
+              and(
+                eq(githubInstallations.id, repoRef.installationId),
+                eq(githubInstallations.orgId, run.orgId),
+                sql`lower(${githubInstallations.accountLogin}) = lower(${repoRef.owner})`,
+                isNull(githubInstallations.suspendedAt),
+              ),
+            )
+            .limit(1)
+        )[0];
+        if (!installation) {
+          throw new ApiError(409, "no_installation", "Run repository has no GitHub installation");
+        }
+        return { run, sandbox, repoRef, installation };
+      };
+
+      const initial = await loadIssuanceContext(db);
+      const workflowWrite = body.workflowWrite ?? false;
+      const permissions: Record<string, string> = workflowWrite
+        ? { contents: "write", workflows: "write" }
+        : { contents: "write" };
+      const permissionNames = Object.keys(permissions);
       const tokenFactory =
         app.githubInstallationTokenFactory ?? createGithubInstallationTokenFactory(config);
-      const token = await tokenFactory({
-        installationId: installation.installationId,
-        owner: repoRef.owner,
-        repo: repoRef.name,
-        permissions: { contents: "write" },
+      if (initial.run.repositoryWriteTrackingVersion !== 1) {
+        if (isTrackedPushTokenRequest(body)) {
+          throw new ApiError(
+            409,
+            "repository_write_tracking_required",
+            "Run did not negotiate durable repository write tracking",
+          );
+        }
+        const credential = await mintRepositoryWriteCredential(tokenFactory, initial, permissions);
+        const { issuedAt, expiresAt } = exactCredentialTimes(credential);
+        await insertAuditEvent(db, {
+          orgId: initial.run.orgId,
+          projectId: initial.run.projectId,
+          actor: { type: "agent", id: initial.run.id },
+          action: "run.push_token_issued",
+          target: { type: "run", id: initial.run.id },
+          payload: {
+            repoId: initial.repoRef.id,
+            provider: "github_installation",
+            permissions: permissionNames,
+            issuedAt: issuedAt.toISOString(),
+            expiresAt: expiresAt.toISOString(),
+            repositoryWriteTrackingVersion: 0,
+          },
+        });
+        // Rolling-deploy compatibility only. There is deliberately no
+        // invented branch evidence, and tracking version 0 makes this run
+        // permanently fail closed for governed retry.
+        return { token: credential.token, authorizedBranch: null };
+      }
+      if (!isTrackedPushTokenRequest(body)) {
+        throw new ApiError(
+          409,
+          "repository_write_tracking_required",
+          "Tracked runner omitted its durable repository write intent",
+        );
+      }
+      const githubFactory = app.githubClientFactory ?? createGithubClientFactory(config);
+      const github = new FacilityGithubClient(
+        await githubFactory(initial.installation.installationId),
+        {
+          owner: initial.repoRef.owner,
+          repo: initial.repoRef.name,
+          defaultBranch: initial.repoRef.defaultBranch,
+        },
+      );
+      const authorizedBranch = repairRepositoryMode(initial.run.mode)
+        ? await verifyExistingRepositoryWriteBranch(
+            github,
+            initial.run,
+            initial.repoRef,
+            body.requestedBranch,
+            body.baseSha,
+          )
+        : await selectAvailableRepositoryWriteBranch(github, body.requestedBranch, initial.run.id);
+
+      // Transaction 1 commits durable evidence before any provider call. If
+      // token minting becomes ambiguous, this reservation remains and later
+      // retry admission fails closed until explicit reconciliation.
+      const lease = await db.transaction(async (transaction) => {
+        const tx = transaction as unknown as FacilityDb;
+        const current = await loadIssuanceContext(tx);
+        if (
+          current.repoRef.id !== initial.repoRef.id ||
+          current.installation.id !== initial.installation.id
+        ) {
+          throw new ApiError(
+            409,
+            "repository_write_context_changed",
+            "Repository write context changed before reservation",
+          );
+        }
+        return reserveRepositoryWriteLease(tx, {
+          orgId: current.run.orgId,
+          projectId: current.run.projectId,
+          runId: current.run.id,
+          repoId: current.repoRef.id,
+          requestedBranch: body.requestedBranch,
+          authorizedBranch,
+          baseSha: body.baseSha,
+          permissions: permissionNames,
+        });
       });
-      await insertAuditEvent(db, {
-        orgId: run.orgId,
-        projectId: run.projectId,
-        actor: { type: "agent", id: run.id },
-        action: "run.push_token_issued",
-        target: { type: "run", id: run.id },
-        payload: { repoId: repoRef.id },
+
+      let credential: Awaited<ReturnType<typeof tokenFactory>>;
+      try {
+        credential = await mintRepositoryWriteCredential(tokenFactory, initial, permissions);
+      } catch {
+        throw new ApiError(
+          503,
+          "repository_write_credential_indeterminate",
+          "Repository write credential issuance is indeterminate",
+          undefined,
+          true,
+        );
+      }
+      const { issuedAt, expiresAt } = exactCredentialTimes(credential);
+
+      // Transaction 2 makes the exact provider expiry and audit durable. A
+      // commit failure leaves transaction 1's reservation visible and the
+      // credential is never returned to the runner.
+      await db.transaction(async (transaction) => {
+        const tx = transaction as unknown as FacilityDb;
+        await markRepositoryWriteLeaseIssued(tx, lease, issuedAt, expiresAt);
+        await insertAuditEvent(tx, {
+          orgId: initial.run.orgId,
+          projectId: initial.run.projectId,
+          actor: { type: "agent", id: initial.run.id },
+          action: "run.push_token_issued",
+          target: { type: "run", id: initial.run.id },
+          payload: {
+            leaseId: lease.id,
+            repoId: initial.repoRef.id,
+            requestedBranch: body.requestedBranch,
+            authorizedBranch,
+            baseSha: body.baseSha.toLowerCase(),
+            provider: "github_installation",
+            permissions: permissionNames,
+            issuedAt: issuedAt.toISOString(),
+            expiresAt: expiresAt.toISOString(),
+          },
+        });
       });
-      return { token };
+      return { token: credential.token, authorizedBranch };
     },
   );
 
@@ -356,7 +643,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
     "/internal/runs/:runId/transcript",
     {
       config: { public: true },
-      preHandler: authenticate,
+      preHandler: [authenticate, leaseRunnerMutation],
       schema: {
         params: Params,
         response: { 200: z.object({ uri: z.string() }) },
@@ -389,7 +676,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
     "/internal/runs/:runId/session-state",
     {
       config: { public: true },
-      preHandler: authenticate,
+      preHandler: [authenticate, leaseRunnerMutation],
       schema: {
         params: Params,
         response: { 200: z.object({ uri: z.string() }) },
@@ -501,6 +788,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
       return (await finishRun(db, run, body, {
         config,
         githubClientFactory: app.githubClientFactory,
+        transitionDb: app.runTransitionDb,
         enqueue: app.enqueue,
       })) as unknown as Record<string, unknown>;
     },
@@ -514,40 +802,59 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
   const cloneTokenFallback = (): string | null =>
     config.facilityInsecureDev ? (config.githubCloneToken ?? null) : null;
 
-  async function repoTokenForRun(sandbox: RunSandboxState): Promise<string | null> {
-    const repo = sandbox.bundle?.repo;
-    if (!repo?.installationTokenRef || !repo.cloneUrl) return cloneTokenFallback();
+  async function repoTokenForRun(
+    run: typeof runs.$inferSelect,
+    sandbox: RunSandboxState,
+  ): Promise<string | null> {
+    const bundleRepo = sandbox.bundle?.repo;
+    if (!bundleRepo?.installationTokenRef || !bundleRepo.cloneUrl) return cloneTokenFallback();
+    const parsed = parseGithubCloneUrl(bundleRepo.cloneUrl);
+    if (!parsed) return cloneTokenFallback();
+    const boundRepo = await repoForRun(run, sandbox);
+    if (!boundRepo || boundRepo.installationId !== bundleRepo.installationTokenRef) {
+      return cloneTokenFallback();
+    }
     const installation = (
       await db
         .select()
         .from(githubInstallations)
-        .where(eq(githubInstallations.id, repo.installationTokenRef))
+        .where(
+          and(
+            eq(githubInstallations.id, bundleRepo.installationTokenRef),
+            eq(githubInstallations.orgId, run.orgId),
+            sql`lower(${githubInstallations.accountLogin}) = lower(${parsed.owner})`,
+            isNull(githubInstallations.suspendedAt),
+          ),
+        )
         .limit(1)
     )[0];
     if (!installation) return cloneTokenFallback();
-    const parsed = parseGithubCloneUrl(repo.cloneUrl);
-    if (!parsed) return cloneTokenFallback();
     const tokenFactory =
       app.githubInstallationTokenFactory ??
       (config.githubAppId && config.githubAppPrivateKey
         ? createGithubInstallationTokenFactory(config)
         : null);
     if (!tokenFactory) return cloneTokenFallback();
-    return tokenFactory({
+    const credential = await tokenFactory({
       installationId: installation.installationId,
       owner: parsed.owner,
       repo: parsed.repo,
       permissions: { contents: "read" },
     });
+    return credential.token;
   }
 
-  async function repoForRun(run: typeof runs.$inferSelect, sandbox: RunSandboxState) {
+  async function repoForRun(
+    run: typeof runs.$inferSelect,
+    sandbox: RunSandboxState,
+    database: FacilityDb = db,
+  ) {
     const parsed = sandbox.bundle?.repo?.cloneUrl
       ? parseGithubCloneUrl(sandbox.bundle.repo.cloneUrl)
       : null;
     if (!parsed) return null;
     return (
-      await db
+      await database
         .select()
         .from(repos)
         .where(
@@ -560,6 +867,60 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
         )
         .limit(1)
     )[0];
+  }
+
+  function assertRepositoryWriteIntent(
+    run: typeof runs.$inferSelect,
+    sandbox: RunSandboxState,
+    requestedBranch: string,
+    baseSha: string,
+  ) {
+    const normalizedBaseSha = baseSha.toLowerCase();
+    const workspaceBaseSha = gitCommitSha(run.workspaceBaseSha);
+    const bundleBaseSha = gitCommitSha(sandbox.bundle?.repo.expectedHeadSha);
+    const checkoutBranch = sandbox.bundle?.repo.branch;
+    if (
+      !workspaceBaseSha ||
+      normalizedBaseSha !== workspaceBaseSha ||
+      (bundleBaseSha && bundleBaseSha !== normalizedBaseSha) ||
+      !checkoutBranch
+    ) {
+      throw new ApiError(
+        409,
+        "repository_write_base_mismatch",
+        "Repository write intent does not match the verified workspace base",
+      );
+    }
+    if (repairRepositoryMode(run.mode)) {
+      const expectedBranch = stringValue(objectValue(run.gh).branch);
+      if (
+        !expectedBranch ||
+        requestedBranch !== expectedBranch ||
+        requestedBranch !== checkoutBranch
+      ) {
+        throw new ApiError(
+          409,
+          "repository_write_branch_mismatch",
+          "Repository repair must target the exact admitted pull-request branch",
+        );
+      }
+      assertGithubRefName(requestedBranch);
+      return;
+    }
+    if (
+      !isBuilderMode(run.mode) ||
+      requestedBranch === checkoutBranch ||
+      !/^(feature|fix|chore|ci|docs|refactor|perf|test|build|revert)\/[a-z0-9][a-z0-9._/-]*$/.test(
+        requestedBranch,
+      )
+    ) {
+      throw new ApiError(
+        409,
+        "repository_write_branch_mismatch",
+        "Builder repository writes require a new semantic branch",
+      );
+    }
+    assertGithubRefName(requestedBranch);
   }
 
   async function securitySweepEvidenceForRun(
@@ -627,6 +988,57 @@ function bearer(value: string | undefined) {
   return value.slice("Bearer ".length);
 }
 
+function isTrackedPushTokenRequest(
+  value: NonNullable<z.infer<typeof PushTokenRequest>>,
+): value is z.infer<typeof TrackedPushTokenRequest> {
+  return "requestedBranch" in value && "baseSha" in value;
+}
+
+async function mintRepositoryWriteCredential(
+  tokenFactory: GithubInstallationTokenFactory,
+  context: {
+    installation: { installationId: number };
+    repoRef: { owner: string; name: string };
+  },
+  permissions: Record<string, string>,
+) {
+  try {
+    return await tokenFactory({
+      installationId: context.installation.installationId,
+      owner: context.repoRef.owner,
+      repo: context.repoRef.name,
+      permissions,
+    });
+  } catch {
+    throw new ApiError(
+      503,
+      "repository_write_credential_indeterminate",
+      "Repository write credential issuance is indeterminate",
+      undefined,
+      true,
+    );
+  }
+}
+
+function exactCredentialTimes(credential: { token: string; expiresAt: string }) {
+  const issuedAt = new Date();
+  const expiresAt = new Date(credential.expiresAt);
+  if (
+    !credential.token ||
+    !Number.isFinite(expiresAt.getTime()) ||
+    expiresAt.getTime() <= issuedAt.getTime()
+  ) {
+    throw new ApiError(
+      503,
+      "repository_write_credential_indeterminate",
+      "Repository write credential expiry is indeterminate",
+      undefined,
+      true,
+    );
+  }
+  return { issuedAt, expiresAt };
+}
+
 function parseGithubCloneUrl(value: string): { owner: string; repo: string } | null {
   const match = value.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?$/);
   if (!match?.[1] || !match[2]) return null;
@@ -635,4 +1047,104 @@ function parseGithubCloneUrl(value: string): { owner: string; repo: string } | n
 
 function isSecuritySweepMode(mode: string) {
   return ["security", "security_sweep"].includes(mode.replace(/^codex-/, "").replace(/-/g, "_"));
+}
+
+function repairRepositoryMode(mode: string) {
+  return ["address_review", "ci_doctor"].includes(mode.replace(/^codex-/, "").replace(/-/g, "_"));
+}
+
+async function verifyExistingRepositoryWriteBranch(
+  github: FacilityGithubClient,
+  run: typeof runs.$inferSelect,
+  repo: typeof repos.$inferSelect,
+  branch: string,
+  baseSha: string,
+) {
+  await github.assertRepositoryAccessible();
+  const triggerPullRequest = objectValue(objectValue(run.trigger).pullRequest);
+  const pullNumber = numberValue(triggerPullRequest.number);
+  const admittedHead = stringValue(triggerPullRequest.head);
+  const admittedHeadSha = gitCommitSha(triggerPullRequest.headSha);
+  const admittedBase = stringValue(triggerPullRequest.base);
+  if (
+    !pullNumber ||
+    admittedHead !== branch ||
+    admittedHeadSha !== gitCommitSha(baseSha) ||
+    admittedBase !== repo.defaultBranch ||
+    numberValue(objectValue(run.gh).issueNumber) !== pullNumber
+  ) {
+    throw new ApiError(
+      409,
+      "repository_write_pull_request_mismatch",
+      "Repository repair is not bound to its admitted pull request",
+    );
+  }
+  try {
+    const [headSha, pullRequest] = await Promise.all([
+      github.getRef(branch),
+      github.getPullRequestWriteTarget(pullNumber),
+    ]);
+    const repository = `${repo.owner}/${repo.name}`.toLowerCase();
+    if (
+      gitCommitSha(headSha) !== gitCommitSha(baseSha) ||
+      pullRequest.number !== pullNumber ||
+      pullRequest.state !== "open" ||
+      pullRequest.mergedAt !== null ||
+      pullRequest.headRepo.toLowerCase() !== repository ||
+      pullRequest.baseRepo.toLowerCase() !== repository ||
+      pullRequest.headRef !== branch ||
+      gitCommitSha(pullRequest.headSha) !== gitCommitSha(baseSha) ||
+      pullRequest.baseRef !== admittedBase
+    ) {
+      throw new Error("pull_request_write_target_changed");
+    }
+  } catch {
+    throw new ApiError(
+      409,
+      "repository_write_pull_request_mismatch",
+      "Repository repair pull request could not be verified",
+    );
+  }
+  return branch;
+}
+
+function assertGithubRefName(branch: string) {
+  if (
+    !branch ||
+    branch.length > 255 ||
+    branch.startsWith("/") ||
+    branch.endsWith("/") ||
+    branch.endsWith(".") ||
+    branch.includes("..") ||
+    branch.includes("@{") ||
+    [...branch].some((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code <= 32 || code === 127;
+    }) ||
+    ["~", "^", ":", "?", "*", "[", "\\"].some((character) => branch.includes(character))
+  ) {
+    throw new ApiError(
+      409,
+      "repository_write_branch_mismatch",
+      "Repository write branch is not a valid GitHub ref name",
+    );
+  }
+}
+
+function gitCommitSha(value: unknown) {
+  return typeof value === "string" && /^[a-f0-9]{40}$/i.test(value) ? value.toLowerCase() : null;
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function numberValue(value: unknown) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 }

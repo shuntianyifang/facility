@@ -10,8 +10,9 @@ import {
 } from "@facility/db";
 import { and, eq, sql } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
+import { acquireExclusiveRunTransitionTransactionLease } from "../run-api-key-lease.js";
 import { failRun, finishConversationTurn, revokeRunKeys } from "../sandbox/orchestrator.js";
-import { appendRunEvents } from "../sandbox/state.js";
+import { appendRunEvents, readSandbox } from "../sandbox/state.js";
 import type { AppConfig } from "../types.js";
 import { assistantSystemPrompt } from "./prompt.js";
 import { ASSISTANT_TOOLS } from "./tools.js";
@@ -326,11 +327,17 @@ export async function runAssistantTurn(input: AssistantTurnInput): Promise<void>
       type: "assistant",
       message: { content: [{ type: "text", text }] },
     });
-    const succeeded = await db
-      .update(runs)
-      .set({ status: "succeeded", endedAt: new Date(), updatedAt: new Date() })
-      .where(and(eq(runs.orgId, orgId), eq(runs.id, runId), eq(runs.status, "running")))
-      .returning({ id: runs.id, trigger: runs.trigger });
+    const succeeded = await input.app.runTransitionDb.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      await acquireExclusiveRunTransitionTransactionLease(tx, runId);
+      const succeeded = await tx
+        .update(runs)
+        .set({ status: "succeeded", endedAt: new Date(), updatedAt: new Date() })
+        .where(and(eq(runs.orgId, orgId), eq(runs.id, runId), eq(runs.status, "running")))
+        .returning({ id: runs.id, trigger: runs.trigger, sandbox: runs.sandbox });
+      for (const row of succeeded) await revokeRunKeys(tx, readSandbox(row.sandbox));
+      return succeeded;
+    });
     if (succeeded.length === 0) return; // cancelled mid-flight — cancel path owns cleanup
     await emit("result", { status: "succeeded" });
     const runRow = (
@@ -346,7 +353,14 @@ export async function runAssistantTurn(input: AssistantTurnInput): Promise<void>
     await maybeTitleConversation(db, driver, input, conversationId, text).catch(() => undefined);
   } catch (error) {
     const message = error instanceof Error ? error.message : "assistant_turn_failed";
-    await failRun(db, orgId, runId, message, "assistant_turn_failed").catch(() => undefined);
+    await failRun(
+      db,
+      orgId,
+      runId,
+      message,
+      "assistant_turn_failed",
+      input.app.runTransitionDb,
+    ).catch(() => undefined);
   } finally {
     turns.delete(runId);
     releaseAssistantTurn(runId);

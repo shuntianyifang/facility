@@ -251,6 +251,17 @@ function checksList(checks: string[]): string {
   return lines.join("\n");
 }
 
+// The provision command is interpolated into a YAML block scalar, not a bare
+// scalar: a command containing ": " (and the no-provision fallback does)
+// otherwise renders a workflow GitHub cannot parse. Mirrors provisionRun in
+// packages/cli/src/init.mjs — the byte-for-byte parity test holds them equal.
+function provisionRun(command: string): string {
+  return command
+    .split("\n")
+    .map((line) => `          ${line}`)
+    .join("\n");
+}
+
 function checksRun(checks: string[]): string {
   if (checks.length) return checks.map((command) => `          ${command}`).join("\n");
   return [
@@ -453,6 +464,7 @@ export async function renderFacilityInit(
         ? "false"
         : "true",
     PROVISION_CMD: provision,
+    PROVISION_RUN: provisionRun(provision),
     CHECKS_INLINE: checks.length ? checks.join(" ; ") : "the checks configured in STANDARD.md",
     CHECKS_LIST: checksList(checks),
     CHECKS_RUN: checksRun(checks),

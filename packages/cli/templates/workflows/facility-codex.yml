@@ -155,7 +155,8 @@ jobs:
 {{TOOLCHAIN_STEPS}}
       - name: Provision environment
         if: steps.resolve.outputs.run == 'true'
-        run: {{PROVISION_CMD}}
+        run: |
+{{PROVISION_RUN}}
 
       - name: Install pinned Codex CLI
         if: steps.resolve.outputs.run == 'true'

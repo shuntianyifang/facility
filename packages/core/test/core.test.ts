@@ -113,6 +113,7 @@ describe("ids", () => {
   it("creates prefixed uuidv7 ids", () => {
     expect(newId("proj")).toMatch(/^proj_[0-9a-f]{32}$/);
     expect(newId("pvh")).toMatch(/^pvh_[0-9a-f]{32}$/);
+    expect(newId("rwl")).toMatch(/^rwl_[0-9a-f]{32}$/);
   });
 });
 
@@ -279,63 +280,80 @@ describe("fingerprints", () => {
 });
 
 describe("render", () => {
-  it("matches the real CLI init output byte-for-byte", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "facility-core-render-"));
-    writeFileSync(
-      join(dir, "package.json"),
-      `${JSON.stringify(
-        {
-          scripts: {
-            setup: "node setup.mjs",
-            typecheck: "tsc --noEmit",
-            test: "vitest run",
+  // The provision command reaches the workflows through a YAML block scalar,
+  // so a command containing ": " renders differently from an ordinary one and
+  // the no-provision fallback contains ": " itself. Both renderers have to
+  // agree on all three shapes, not just the easy one.
+  const provisionShapes = [
+    { name: "an ordinary provision command", provision: "pnpm run setup", setupScript: true },
+    {
+      name: 'a provision command containing ": "',
+      provision: 'docker compose up -d && echo "db: ready"',
+      setupScript: true,
+    },
+    { name: "no provision command, so both fall back", provision: undefined, setupScript: false },
+  ];
+
+  for (const shape of provisionShapes) {
+    it(`matches the real CLI init output byte-for-byte with ${shape.name}`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "facility-core-render-"));
+      writeFileSync(
+        join(dir, "package.json"),
+        `${JSON.stringify(
+          {
+            scripts: {
+              // `setup` is what CLI detection proposes as the provision
+              // command, so omitting it is what exercises the fallback.
+              ...(shape.setupScript ? { setup: "node setup.mjs" } : {}),
+              typecheck: "tsc --noEmit",
+              test: "vitest run",
+            },
           },
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
-    mkdirSync(join(dir, "migrations"), { recursive: true });
-    writeFileSync(join(dir, "migrations/001.sql"), "select 1;\n");
-    execFileSync("node", [
-      join(process.cwd(), "../cli/bin/facility.mjs"),
-      "init",
-      "--yes",
-      "--dir",
-      dir,
-      "--branch",
-      "main",
-      "--provision",
-      "pnpm run setup",
-      "--checks",
-      "pnpm run typecheck, pnpm run test",
-      "--modules",
-      "database",
-    ]);
-    const cliFiles = collect(dir);
-    const rendered = await renderFacilityInit({
-      defaultBranch: "main",
-      provisionCmd: "pnpm run setup",
-      checkCmds: ["pnpm run typecheck", "pnpm run test"],
-      modules: ["database"],
-      packageManager: "pnpm",
-      workflowNames: [],
+          null,
+          2,
+        )}\n`,
+      );
+      writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+      mkdirSync(join(dir, "migrations"), { recursive: true });
+      writeFileSync(join(dir, "migrations/001.sql"), "select 1;\n");
+      execFileSync("node", [
+        join(process.cwd(), "../cli/bin/facility.mjs"),
+        "init",
+        "--yes",
+        "--dir",
+        dir,
+        "--branch",
+        "main",
+        ...(shape.provision ? ["--provision", shape.provision] : []),
+        "--checks",
+        "pnpm run typecheck, pnpm run test",
+        "--modules",
+        "database",
+      ]);
+      const cliFiles = collect(dir);
+      const rendered = await renderFacilityInit({
+        defaultBranch: "main",
+        provisionCmd: shape.provision,
+        checkCmds: ["pnpm run typecheck", "pnpm run test"],
+        modules: ["database"],
+        packageManager: "pnpm",
+        workflowNames: [],
+      });
+      const coreFiles = new Map(
+        rendered.files.map((file) => [
+          file.path,
+          {
+            mode: file.mode ?? (file.executable ? "100755" : "100644"),
+            content: file.content,
+          },
+        ]),
+      );
+      expect([...coreFiles.keys()].sort()).toEqual([...cliFiles.keys()].sort());
+      for (const [path, cliFile] of cliFiles) {
+        expect(coreFiles.get(path), path).toEqual(cliFile);
+      }
     });
-    const coreFiles = new Map(
-      rendered.files.map((file) => [
-        file.path,
-        {
-          mode: file.mode ?? (file.executable ? "100755" : "100644"),
-          content: file.content,
-        },
-      ]),
-    );
-    expect([...coreFiles.keys()].sort()).toEqual([...cliFiles.keys()].sort());
-    for (const [path, cliFile] of cliFiles) {
-      expect(coreFiles.get(path), path).toEqual(cliFile);
-    }
-  });
+  }
 
   it("keeps platform-lane slash commands out of repo workflows", async () => {
     const rendered = await renderFacilityInit({

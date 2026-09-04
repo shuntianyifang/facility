@@ -8,6 +8,7 @@ const expectedProducerCounts = new Map([
   ["executors.ts", 5],
   ["github/processor.ts", 1],
   ["github/router.ts", 1],
+  ["governed-builder-retry.ts", 1],
   ["integrations/inbound.ts", 1],
   ["learning.ts", 1],
   ["routes/v1/assistant.ts", 1],
@@ -54,7 +55,7 @@ describe("Builder plan producer inventory", () => {
       });
     }
 
-    expect(inserts).toHaveLength(19);
+    expect(inserts).toHaveLength(20);
     expect(
       new Map(
         [...new Set(inserts.map((insert) => insert.relativeFile))].map((file) => [
@@ -117,6 +118,16 @@ function persistsAdmissionMode(
         /admittedMode\s*=\s*admission\.mode\b/.test(body) && /mode\s*:\s*admittedMode\b/.test(body)
       );
     }
+    if (
+      relativeFile === "governed-builder-retry.ts" &&
+      ts.isPropertyAccessExpression(call.expression) &&
+      call.expression.name.text === "transaction"
+    ) {
+      return (
+        body.includes("assertGovernedRetryLockedAdmission(") &&
+        /mode\s*:\s*lockedParent\.mode\b/.test(body)
+      );
+    }
   }
   return false;
 }
@@ -140,6 +151,17 @@ function hasTransactionalAdmissionAncestor(
     ) {
       const body = current.getText(sourceFile);
       return body.includes("lockBuilderPlanPolicy(") && body.includes("assertBuilderPlanDispatch(");
+    }
+    if (
+      relativeFile === "governed-builder-retry.ts" &&
+      ts.isPropertyAccessExpression(call.expression) &&
+      call.expression.name.text === "transaction"
+    ) {
+      const body = current.getText(sourceFile);
+      return (
+        body.includes("lockBuilderPlanPolicy(") &&
+        body.includes("assertGovernedRetryLockedAdmission(")
+      );
     }
   }
   return false;

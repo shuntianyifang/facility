@@ -122,9 +122,10 @@ export async function resolveBuilderPlanFreshnessForProposal(
     if (error instanceof ApiError && error.code === "builder_plan_freshness_unavailable") {
       throw error;
     }
-    throw freshnessUnavailable(
-      error instanceof Error ? `github_freshness_error:${error.message}` : "github_freshness_error",
-    );
+    // Provider errors can include URLs, installation identifiers, or request
+    // fragments. Keep the public/audited reason stable and sanitized; the
+    // original exception remains available to process-local observability.
+    throw freshnessUnavailable("github_freshness_error");
   }
 }
 

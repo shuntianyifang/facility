@@ -38,7 +38,7 @@ export default async function ProjectStoriesPage({
   if (!storiesResult.ok && storiesResult.offline) return <Offline />;
   const stories = storiesResult.ok ? storiesResult.data.stories : [];
   const agents = agentsResult.ok ? agentsResult.data.agents : [];
-  const canStart = me.ok && can(me.data.permissions, "runs:execute");
+  const canStart = me.ok && can(me.data.permissions, "workspaces:execute");
 
   return (
     <div className="flex flex-col gap-8">

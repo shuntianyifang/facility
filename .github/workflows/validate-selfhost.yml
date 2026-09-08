@@ -1,0 +1,49 @@
+name: Validate lifecycle self-host images
+
+on:
+  push:
+    branches: [codex/validate-selfhost-lifecycle]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  self-host-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SECRET_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Record source and build environment
+        run: |
+          git rev-parse HEAD
+          git rev-parse HEAD^
+          docker version
+          docker compose version
+          free -h
+          df -h /
+
+      - name: Build the documented self-host stack from a clean checkout
+        run: |
+          set -o pipefail
+          docker compose build --pull 2>&1 | tee /tmp/selfhost-compose.log
+
+      - name: Verify Vercel runner user switching without live credentials
+        run: |
+          set -o pipefail
+          docker build --target vercel-runner -t facility-lifecycle-vercel:validation -f runner/Dockerfile . 2>&1 | tee /tmp/selfhost-vercel.log
+
+      - name: Record built images
+        run: docker image ls --digests
+
+      - name: Preserve build logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: selfhost-build-logs
+          path: /tmp/selfhost-*.log
+          if-no-files-found: warn
+          retention-days: 7

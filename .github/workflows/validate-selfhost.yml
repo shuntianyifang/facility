@@ -116,9 +116,11 @@ jobs:
         run: pnpm verify
 
       - name: Install browser acceptance runtime
+        if: ${{ !cancelled() }}
         run: pnpm --filter @facility/web exec playwright install --with-deps chromium
 
       - name: Verify workspace lifecycle through the web UI
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: postgres://facility:facility@127.0.0.1:5461/facility_test
         run: |

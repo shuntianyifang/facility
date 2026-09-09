@@ -15,6 +15,7 @@ import {
   projectRepositories,
   seed,
   turns,
+  workspaces,
 } from "@facility/db";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -506,6 +507,13 @@ environment:
       next_operations: mcpStory.next_operations,
     });
 
+    // Native agents can change HEAD after setup. Browser verification must preserve
+    // the prepared workspace even when its recorded setup checksum differs.
+    const retainedChecksum = "prepared-before-the-agent-commit";
+    await db
+      .update(workspaces)
+      .set({ setupChecksum: retainedChecksum })
+      .where(eq(workspaces.id, workspaceId));
     const browserTest = await app.inject({
       method: "POST",
       url: `/v1/projects/${projectId}/workspace-stories/${storyId}/environment/browser-test`,
@@ -513,6 +521,11 @@ environment:
     });
     expect(browserTest.statusCode, browserTest.body).toBe(200);
     expect(browserTest.json().browser_test.artifacts).toHaveLength(2);
+    expect(await runtime.read(workspace, `repos/${owner}/${repository}/.setup-complete`)).toBe("1");
+    expect(browserTest.json().workspace.setupChecksum).toBe(retainedChecksum);
+    expect(await runtime.read(workspace, ".facility/codex/native-session")).toBe(
+      "codex-persistent-session",
+    );
     const cleanSetup = await app.inject({
       method: "POST",
       url: `/v1/projects/${projectId}/workspace-stories/${storyId}/environment/clean-setup`,

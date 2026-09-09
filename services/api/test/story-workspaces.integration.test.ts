@@ -7,11 +7,15 @@ import { newId } from "@facility/core";
 import {
   attentionItems,
   createDb,
+  githubInstallations,
   migrate,
   orgs,
+  projectRepositories,
   projects,
   stories,
+  storyEvidenceEvents,
   storyMessages,
+  turnGitEvidence,
   turns,
   workspaces,
 } from "@facility/db";
@@ -73,6 +77,7 @@ describe("persistent story workspace lifecycle", async () => {
   const projectId = newId("proj");
   const otherOrgId = newId("org");
   const otherProjectId = newId("proj");
+  const repositoryId = newId("repo");
 
   beforeAll(async () => {
     await migrate(databaseUrl);
@@ -96,6 +101,25 @@ describe("persistent story workspace lifecycle", async () => {
         settings: {},
       },
     ]);
+    const installationId = newId("ghi");
+    await db.insert(githubInstallations).values({
+      id: installationId,
+      orgId,
+      installationId: Math.floor(Math.random() * 1_000_000_000) + 20_000,
+      accountId: 123,
+      accountLogin: "acme",
+      targetType: "Organization",
+    });
+    await db.insert(projectRepositories).values({
+      id: repositoryId,
+      orgId,
+      projectId,
+      installationId,
+      owner: "acme",
+      name: `app-${suffix}`,
+      defaultBranch: "main",
+      role: "primary",
+    });
   });
 
   afterAll(async () => {
@@ -120,6 +144,172 @@ describe("persistent story workspace lifecycle", async () => {
       },
     };
   }
+
+  async function branchFixture(workspaceId?: string) {
+    const result = await service.start({
+      ...startInput(`branch-${randomUUID()}`),
+      branch: "facility/original",
+    });
+    if (!result.workspace || !result.queued.turn) throw new Error("branch fixture missing");
+    const turn = result.queued.turn;
+    const workspace = result.workspace;
+    const finalBranch = `chore/${result.story.id}`;
+    await db.insert(turnGitEvidence).values({
+      turnId: result.queued.turn.id,
+      orgId,
+      projectId,
+      storyId: result.story.id,
+      workspaceId: workspaceId ?? result.workspace.id,
+      engineSessionId: "test-session",
+      initialBranch: "facility/original",
+      initialSha: "a".repeat(40),
+      finalBranch,
+      finalSha: "b".repeat(40),
+      completedAt: new Date(),
+    });
+    const complete = () =>
+      service.completeTurn({
+        orgId,
+        projectId,
+        turnId: turn.id,
+        output: "done",
+        actor: { type: "system", id: "test-engine" },
+      });
+    return { result, finalBranch, complete, turn, workspace };
+  }
+
+  it("follows completed native branch evidence once and permits the matching draft PR", async () => {
+    const fixture = await branchFixture();
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      fixture.finalBranch,
+    );
+    await fixture.complete();
+    const events = await db
+      .select()
+      .from(storyEvidenceEvents)
+      .where(eq(storyEvidenceEvents.storyId, fixture.result.story.id));
+    expect(events.filter((event) => event.type === "story.branch_updated")).toHaveLength(1);
+    await service.associatePullRequest({
+      orgId,
+      projectId,
+      storyId: fixture.result.story.id,
+      branch: fixture.finalBranch,
+      pullRequestNumber: 1549,
+      pullRequestUrl: "https://github.com/acme/app/pull/1549",
+    });
+    expect(
+      (await service.get(orgId, projectId, fixture.result.story.id)).story.pullRequestNumber,
+    ).toBe(1549);
+  });
+
+  it("does not use another story's workspace evidence or cross-tenant calls", async () => {
+    const other = await branchFixture();
+    const fixture = await branchFixture(other.workspace.id);
+    await expect(
+      service.completeTurn({
+        orgId: otherOrgId,
+        projectId: otherProjectId,
+        turnId: fixture.turn.id,
+        output: "done",
+        actor: { type: "system", id: "test" },
+      }),
+    ).rejects.toMatchObject({ code: "turn_not_found" });
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      "facility/original",
+    );
+  });
+
+  it("preserves an existing PR and a concurrent operator branch change", async () => {
+    const linked = await branchFixture();
+    await service.associatePullRequest({
+      orgId,
+      projectId,
+      storyId: linked.result.story.id,
+      branch: "facility/original",
+      pullRequestNumber: 41,
+    });
+    await linked.complete();
+    expect((await service.get(orgId, projectId, linked.result.story.id)).story).toMatchObject({
+      branch: "facility/original",
+      pullRequestNumber: 41,
+    });
+    const changed = await branchFixture();
+    await db
+      .update(stories)
+      .set({ branch: "fix/operator" })
+      .where(eq(stories.id, changed.result.story.id));
+    await changed.complete();
+    expect((await service.get(orgId, projectId, changed.result.story.id)).story.branch).toBe(
+      "fix/operator",
+    );
+  });
+
+  it("does not claim a branch already assigned to another story", async () => {
+    const fixture = await branchFixture();
+    const other = await service.start({
+      ...startInput(`conflict-${randomUUID()}`),
+      repositoryId,
+      branch: fixture.finalBranch,
+    });
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      "facility/original",
+    );
+    expect((await service.get(orgId, projectId, other.story.id)).story.branch).toBe(
+      fixture.finalBranch,
+    );
+  });
+
+  it("does not replay an older turn's branch after a newer request", async () => {
+    const fixture = await branchFixture();
+    await fixture.complete();
+    await service.queueMessage({
+      orgId,
+      projectId,
+      storyId: fixture.result.story.id,
+      body: "Continue",
+      dedupeKey: randomUUID(),
+      agent: builder,
+      actor: { type: "user", id: "test" },
+      trigger: { type: "manual" },
+    });
+    await db
+      .update(stories)
+      .set({ branch: "facility/original" })
+      .where(eq(stories.id, fixture.result.story.id));
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      "facility/original",
+    );
+  });
+
+  it.each([
+    ["failed capture", { captureError: "git failed" }],
+    ["incomplete capture", { completedAt: null }],
+    ["default branch", { finalBranch: "main" }],
+    ["malformed branch", { finalBranch: "--force" }],
+  ])("does not follow %s in persisted evidence", async (_name, values) => {
+    const fixture = await branchFixture();
+    await db.update(turnGitEvidence).set(values).where(eq(turnGitEvidence.turnId, fixture.turn.id));
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      "facility/original",
+    );
+  });
+
+  it("does not follow evidence from a destroyed workspace", async () => {
+    const fixture = await branchFixture();
+    await db
+      .update(workspaces)
+      .set({ state: "destroyed", destroyedAt: new Date() })
+      .where(eq(workspaces.id, fixture.workspace.id));
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      "facility/original",
+    );
+  });
 
   it("starts idempotently and serializes messages behind the active turn", async () => {
     const externalId = `issue-${randomUUID()}`;

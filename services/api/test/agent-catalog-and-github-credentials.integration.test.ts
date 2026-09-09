@@ -55,6 +55,47 @@ Execute the ${name} role and verify the result.
 `;
 }
 
+function catalogGithub() {
+  const state = { sha: "a".repeat(40), denied: 0, childFailure: 0, empty: false };
+  const reads: Array<{ path: string; ref: string }> = [];
+  let branchReads = 0;
+  const factory = (async () => ({
+    rest: {
+      repos: {
+        getBranch: async () => {
+          branchReads++;
+          if (state.denied)
+            throw Object.assign(new Error("Access denied"), { status: state.denied });
+          return { data: { commit: { sha: state.sha } } };
+        },
+        getContent: async ({ path, ref }: { path: string; ref: string }) => {
+          reads.push({ path, ref });
+          if (state.empty) throw Object.assign(new Error("Missing root"), { status: 404 });
+          if (path === ".agents") return { data: [{ type: "file", path: ".agents/builder.md" }] };
+          if (path === ".agents/builder.md")
+            return { data: { type: "file", content: source("builder") } };
+          if (path === ".claude/skills")
+            return { data: [{ type: "dir", path: ".claude/skills/review" }] };
+          if (path === ".claude/skills/review")
+            return { data: [{ type: "file", path: ".claude/skills/review/SKILL.md" }] };
+          if (path === ".claude/skills/review/SKILL.md") {
+            if (state.childFailure)
+              throw Object.assign(new Error("Failed child"), { status: state.childFailure });
+            return {
+              data: {
+                type: "file",
+                content: "---\nname: review\ndescription: Reviews changes.\n---\nReview.",
+              },
+            };
+          }
+          throw new Error("Unexpected path");
+        },
+      },
+    },
+  })) as unknown as GithubClientFactory;
+  return { state, reads, factory, branchReads: () => branchReads };
+}
+
 describe("agent catalog and full GitHub workspace credentials", async () => {
   const reachable = await canConnect();
   if (!reachable) {
@@ -261,9 +302,7 @@ describe("agent catalog and full GitHub workspace credentials", async () => {
                 },
               };
             }
-            return {
-              data: { type: "file", path, encoding: "base64", content: encoded("ignored") },
-            };
+            throw Object.assign(new Error("Optional directory missing"), { status: 404 });
           },
         },
       },
@@ -287,6 +326,92 @@ describe("agent catalog and full GitHub workspace credentials", async () => {
     expect(
       await db.select().from(projectSkills).where(eq(projectSkills.projectId, projectId)),
     ).toHaveLength(1);
+  });
+
+  it("shares complete immutable snapshots across concurrent refreshes while checking access and branch each time", async () => {
+    const github = catalogGithub();
+    const canonical = new GithubAgentCatalogSource(db, github.factory);
+    const snapshots = await Promise.all(
+      Array.from({ length: 20 }, () => canonical.load(orgId, projectId)),
+    );
+    expect(github.branchReads()).toBe(20);
+    expect(github.reads).toHaveLength(5);
+    expect(
+      snapshots.every((snapshot) => snapshot.sources.length === 1 && snapshot.skills?.length === 1),
+    ).toBe(true);
+    const first = snapshots[0];
+    if (!first) throw new Error("Expected a completed catalog snapshot");
+    first.sources.splice(0);
+    expect((await canonical.load(orgId, projectId)).sources).toHaveLength(1);
+    expect(github.reads).toHaveLength(5);
+
+    github.state.sha = "b".repeat(40);
+    expect((await canonical.load(orgId, projectId)).commitSha).toBe(github.state.sha);
+    expect(github.reads).toHaveLength(10);
+    expect(github.reads.slice(5).every((read) => read.ref === github.state.sha)).toBe(true);
+
+    for (const status of [401, 403, 404]) {
+      github.state.denied = status;
+      await expect(canonical.load(orgId, projectId)).rejects.toMatchObject({
+        code: "agent_catalog_unavailable",
+      });
+      expect(github.reads).toHaveLength(10);
+    }
+    github.state.denied = 0;
+    await db
+      .update(githubInstallations)
+      .set({ suspendedAt: new Date() })
+      .where(eq(githubInstallations.id, installationId));
+    try {
+      await expect(canonical.load(orgId, projectId)).rejects.toMatchObject({
+        code: "github_installation_unavailable",
+      });
+    } finally {
+      await db
+        .update(githubInstallations)
+        .set({ suspendedAt: null })
+        .where(eq(githubInstallations.id, installationId));
+    }
+    await expect(canonical.load(newId("org"), projectId)).rejects.toMatchObject({
+      code: "primary_repository_not_found",
+    });
+    await expect(canonical.load(orgId, newId("proj"))).rejects.toMatchObject({
+      code: "primary_repository_not_found",
+    });
+  });
+
+  it.each([
+    403, 404, 429, 500,
+  ])("preserves complete projections after a partial refresh failure (%s) and retries the same commit", async (status) => {
+    const github = catalogGithub();
+    const canonical = new GithubAgentCatalogSource(db, github.factory);
+    const catalog = new AgentCatalogService(db, canonical);
+    await catalog.sync(orgId, projectId);
+    github.state.sha = "b".repeat(40);
+    github.state.childFailure = status;
+    await expect(catalog.sync(orgId, projectId)).rejects.toMatchObject({
+      code: "agent_catalog_unavailable",
+    });
+    expect(await catalog.list(orgId, projectId)).toMatchObject([
+      { name: "builder", commitSha: "a".repeat(40) },
+    ]);
+    expect(await catalog.listSkills(orgId, projectId)).toMatchObject([
+      { name: "review", commitSha: "a".repeat(40) },
+    ]);
+    github.state.childFailure = 0;
+    await catalog.sync(orgId, projectId);
+    expect(await catalog.list(orgId, projectId, { refresh: false })).toMatchObject([
+      { name: "builder", commitSha: "b".repeat(40) },
+    ]);
+    expect(await catalog.listSkills(orgId, projectId, { refresh: false })).toMatchObject([
+      { name: "review", commitSha: "b".repeat(40) },
+    ]);
+    // A successfully read new commit that actually removes both optional roots is authoritative.
+    github.state.sha = "c".repeat(40);
+    github.state.empty = true;
+    await catalog.sync(orgId, projectId);
+    expect(await catalog.list(orgId, projectId, { refresh: false })).toEqual([]);
+    expect(await catalog.listSkills(orgId, projectId, { refresh: false })).toEqual([]);
   });
 
   it("validates an agent edit and writes it to a reviewable Git branch", async () => {
@@ -485,6 +610,7 @@ describe("agent catalog and full GitHub workspace credentials", async () => {
       calls.push(request);
       return {
         token: "full-installation-token",
+        gitIdentity: { name: "my-app[bot]", email: "12345+my-app[bot]@users.noreply.github.com" },
         expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       };
     });
@@ -496,6 +622,10 @@ describe("agent catalog and full GitHub workspace credentials", async () => {
       },
     ]);
     expect(issued.repositories).toHaveLength(2);
+    expect(issued.gitIdentity).toEqual({
+      name: "my-app[bot]",
+      email: "12345+my-app[bot]@users.noreply.github.com",
+    });
     const serializedCredentials = issued.environment.FACILITY_GITHUB_CREDENTIALS;
     if (!serializedCredentials) throw new Error("expected serialized GitHub credentials");
     expect(JSON.parse(serializedCredentials)).toEqual({
@@ -529,5 +659,12 @@ describe("agent catalog and full GitHub workspace credentials", async () => {
       env: { ...process.env, FACILITY_GITHUB_CREDENTIALS: credentials },
     });
     expect(denied).toMatchObject({ status: 0, stdout: "" });
+  });
+
+  it("does not issue workspace credentials when the App identity lookup fails", async () => {
+    const broker = new GithubWorkspaceCredentialBroker(db, async () => {
+      throw new Error("GitHub App bot identity could not be verified");
+    });
+    await expect(broker.issue(orgId, projectId)).rejects.toThrow("could not be verified");
   });
 });

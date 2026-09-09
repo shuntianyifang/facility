@@ -36,6 +36,12 @@ PostgreSQL separately retains messages, turns, attention items, environment even
 snapshots, costs, audit records, and provider references. Losing either store can make a story
 incomplete, so production backup policy must cover both.
 
+If an agent renames its branch to follow repository conventions, Facility adopts the branch
+recorded in that workspace when the turn succeeds. The next turn continues on it, and matching
+GitHub pull requests can be associated with the story. The change appears in the story's evidence
+history. Facility preserves an existing pull-request association and refuses stale evidence,
+another story's branch, the repository default branch, or an incomplete Git capture.
+
 ## Conversation and turns
 
 Messages are persisted before dispatch. A story permits one queued or running turn; later messages
@@ -56,6 +62,11 @@ the same workspace, agent name, engine, and model. Choosing another agent or cha
 model starts or resumes that configuration's own session while retaining every prior session and
 the shared worktree.
 
+For API-key authentication, Facility passes the current turn's `OPENAI_API_KEY` to native
+`codex exec` as `CODEX_API_KEY`. An explicitly supplied `CODEX_API_KEY` takes precedence. This
+alias applies only to the Codex invocation; it does not change project variables or Claude Code
+authentication. Without either key, Codex uses its saved native authentication.
+
 ## State and retention
 
 Story states are `ready`, `working`, `attention`, `review`, `done`, and `archived`. Archive is
@@ -64,6 +75,21 @@ reversible. Merge and archive never call workspace destruction.
 Workspace compute may be `creating`, `running`, `sleeping`, `error`, or `destroyed`. A sleeping or
 error workspace can retain its durable volume. `destroyed` means the explicit deletion path has
 removed that durable workspace and it cannot be resumed.
+
+If Vercel workspace initialization fails after this operation allocates or resumes compute,
+Facility stops that compute while preserving the persistent disk. A failed wake of an already
+running workspace leaves its active compute alone. A later start reuses the same workspace identity. If the provider
+also refuses the stop, the `workspace_initialize_cleanup_failed` error names the sandbox that an
+operator must stop before retrying. Failed initialization does not queue an agent turn.
+
+Vercel initialization also waits for each authenticated preview gateway to listen. A gateway that
+exits or fails to listen causes initialization to fail, even if the application's own port is
+healthy. The project environment's readiness command checks the application separately.
+
+Vercel workspace sessions can last up to 24 hours, but its command API currently accepts at most
+five hours per command. Facility caps longer command timeouts at five hours and preserves shorter
+timeouts. A command reaching that limit fails its turn; the persistent workspace and any saved
+native agent session remain available for a later turn.
 
 Facility has no age-based deletion rule. Storage continues to accrue until an operator removes a
 workspace. Use budgets and observability to distinguish active compute cost from retained storage,

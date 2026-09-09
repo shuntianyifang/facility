@@ -102,6 +102,7 @@ describe("Facility 0.12 reference journey", async () => {
   };
   const catalog = new AgentCatalogService(db, catalogSource);
   const credentials = new GithubWorkspaceCredentialBroker(db, async () => ({
+    gitIdentity: { name: "my-app[bot]", email: "12345+my-app[bot]@users.noreply.github.com" },
     token: "e2e-maintainer-installation-token",
     expiresAt: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
   }));

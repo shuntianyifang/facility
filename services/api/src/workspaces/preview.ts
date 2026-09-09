@@ -63,15 +63,19 @@ export class WorkspacePreviewService {
         .where(and(eq(stories.orgId, input.orgId), eq(stories.id, story.id)));
     }
     await this.runtime.wake(locator(workspace));
-    const prepared = await this.environment.prepare({
+    const environmentInput = {
       orgId: input.orgId,
       projectId: input.projectId,
       workspace: locator(workspace),
       manifest,
       credentials,
-      branch,
-      previousSetupChecksum: workspace.setupChecksum,
-    });
+    };
+    const prepared = workspace.setupChecksum
+      ? await this.environment.startPrepared({
+          ...environmentInput,
+          setupChecksum: workspace.setupChecksum,
+        })
+      : await this.environment.prepare({ ...environmentInput, branch });
     if (!prepared.endpoints.some((endpoint) => endpoint.service === input.service)) {
       throw new WorkspacePreviewError(
         "preview_service_not_found",

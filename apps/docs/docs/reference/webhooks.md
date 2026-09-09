@@ -39,6 +39,27 @@ The GitHub trigger `event` must match one of those event names, and optional `ac
 must match the payload. The manifest must be enabled at the current primary-repository commit.
 Facility records the trigger identity and manifest snapshot on the resulting turn.
 
+Before starting an agent from an issue or issue comment, Facility checks the human sender's current
+repository permission using the connected repository's active GitHub App installation. The sender
+must have write access or higher (including maintain and admin). Bots cannot start agents through
+these issue events. PR, review, and CI triggers retain their event-specific behavior, including bot
+senders.
+Webhook `author_association` fields do not replace that check. GitHub's permission endpoint supports
+installation tokens with [Metadata read access](https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user).
+Provider outages retry the affected delivery independently without granting permission. Processing
+failures are recorded in the webhook event; authorization denials are recorded as
+`github.agent_trigger.denied` audit events without provider response bodies or credentials.
+If GitHub throttles a delivery, its receipt remains unprocessed and the worker durably defers it
+until the provider's reset or retry deadline (at least one minute, bounded to one day for invalid
+far-future values). Repository permission is
+checked again when processing resumes; a rate limit never grants access or becomes a permanent
+authorization denial. The worker logs the deferred job and its retry time.
+
+An optional `command` on an `issue_comment` trigger restricts activation to a new explicit command
+on an open issue. See [the agent manifest reference](agent-manifest.md) for command syntax and
+ambiguous-command rejection. Event filters still need to express the project's intended workflow;
+permission to write a repository does not make every completed workflow an eligible repair request.
+
 Delivery deduplication and story message deduplication are separate. A repeated GitHub delivery id
 is ignored; distinct deliveries that represent the same logical event are also constrained by the
 stable trigger/story identity before dispatch.
@@ -50,6 +71,9 @@ run deliveries update the project mirror where applicable. CI state attaches to 
 request only when the event's head SHA is current. The worker reconciles every connected repository
 every ten minutes, and maintainers can request an immediate sync through MCP, API, or the Pipeline
 page.
+Reconciliation keeps current terminal CI results for unchanged closed or merged pull requests.
+Open pulls, changed heads, missing or pending results, and pulls updated after the last CI refresh
+still request fresh CI. Webhook signals continue to update matching heads, including closed pulls.
 
 The mirror is a local operating view, not a replacement for GitHub. Issue, branch, pull-request,
 review, and check records retain GitHub identity and current state. Check suites and workflow runs

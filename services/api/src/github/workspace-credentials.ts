@@ -1,6 +1,7 @@
 import { type FacilityDb, githubInstallations, projectRepositories } from "@facility/db";
 import { and, asc, eq, inArray } from "drizzle-orm";
 import type { GithubMaintainerTokenFactory } from "./client.js";
+import type { GithubGitIdentity } from "./git-identity.js";
 
 export type WorkspaceRepository = {
   owner: string;
@@ -13,6 +14,7 @@ export type GithubWorkspaceCredentials = {
   repositories: WorkspaceRepository[];
   environment: Record<string, string>;
   expiresAt: Date;
+  gitIdentity: GithubGitIdentity;
 };
 
 export class GithubWorkspaceCredentialError extends Error {
@@ -118,18 +120,22 @@ export class GithubWorkspaceCredentialBroker {
       );
     }
     const primaryToken = credentialMap[`${primary.owner}/${primary.name}`.toLowerCase()];
+    const primaryCredential = primary.installationId
+      ? tokens.get(primary.installationId)
+      : undefined;
     const expiresAt = new Date(
       Math.min(
         ...[...tokens.values()].map((credential) => new Date(credential.expiresAt).getTime()),
       ),
     );
-    if (!primaryToken || !Number.isFinite(expiresAt.getTime())) {
+    if (!primaryToken || !primaryCredential || !Number.isFinite(expiresAt.getTime())) {
       throw new GithubWorkspaceCredentialError(
         "github_token_invalid",
         "GitHub returned an invalid workspace credential",
       );
     }
     return {
+      gitIdentity: primaryCredential.gitIdentity,
       repositories: repositories.map((repository) => ({
         owner: repository.owner,
         name: repository.name,

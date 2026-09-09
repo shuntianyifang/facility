@@ -6,18 +6,26 @@ import { newId } from "@facility/core";
 import {
   createDb,
   migrate,
+  orgMembers,
   orgs,
   projects,
+  roles,
   stories,
   storyArtifacts,
+  users,
   workspaceEvents,
   workspaces,
 } from "@facility/db";
 import { and, desc, eq } from "drizzle-orm";
 import postgres from "postgres";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { GithubWorkspaceCredentials } from "../src/github/workspace-credentials.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import type {
+  GithubWorkspaceCredentialBroker,
+  GithubWorkspaceCredentials,
+} from "../src/github/workspace-credentials.js";
+import type { AppConfig } from "../src/types.js";
 import { FakeWorkspaceRuntime } from "../src/workspaces/fake.js";
+import { WorkspacePreviewService } from "../src/workspaces/preview.js";
 import {
   ProjectEnvironmentService,
   parseProjectManifest,
@@ -81,6 +89,7 @@ environment:
 `);
 
   const credentials: GithubWorkspaceCredentials = {
+    gitIdentity: { name: "my-app[bot]", email: "12345+my-app[bot]@users.noreply.github.com" },
     repositories: [
       { owner: "acme", name: "app", defaultBranch: "main", role: "primary" },
       { owner: "acme", name: "shared", defaultBranch: "main", role: "related" },
@@ -169,6 +178,17 @@ environment:
       cwd: "repos/acme/app",
     });
     expect(branch.stdout.trim()).toBe("facility/story-environment");
+    for (const cwd of ["repos/acme/app", "repos/acme/shared"]) {
+      const author = await runtime.exec(locator, {
+        command: "git",
+        args: ["var", "GIT_AUTHOR_IDENT"],
+        cwd,
+      });
+      expect(author.exitCode).toBe(0);
+      expect(author.stdout).toMatch(
+        /^my-app\[bot\] <12345\+my-app\[bot\]@users\.noreply\.github\.com> /,
+      );
+    }
     expect(
       await readFile(join(workspace.volumeRef, "repos/acme/app/.facility-test/seed"), "utf8"),
     ).toBe("seeded");
@@ -189,6 +209,12 @@ environment:
       await db.select().from(storyArtifacts).where(eq(storyArtifacts.storyId, storyId)),
     ).toHaveLength(2);
 
+    // Repair existing workspaces created with the old unassociated address too.
+    await runtime.exec(locator, {
+      command: "git",
+      args: ["config", "user.email", "facility-agent@users.noreply.github.com"],
+      cwd: "repos/acme/app",
+    });
     await runtime.replaceCompute(locator);
     await environment.prepare({
       orgId,
@@ -200,12 +226,169 @@ environment:
       previousSetupChecksum: first.setupChecksum,
       readinessTimeoutMs: 2_000,
     });
+    const resumedAuthor = await runtime.exec(locator, {
+      command: "git",
+      args: ["var", "GIT_AUTHOR_IDENT"],
+      cwd: "repos/acme/app",
+    });
+    expect(resumedAuthor.stdout).toMatch(
+      /^my-app\[bot\] <12345\+my-app\[bot\]@users\.noreply\.github\.com> /,
+    );
     expect(await readFile(join(workspace.volumeRef, "repos/acme/app/.setup-count"), "utf8")).toBe(
       "1",
     );
     expect(
       await readFile(join(workspace.volumeRef, "repos/acme/shared/README.md"), "utf8"),
     ).toContain("shared");
+  });
+
+  it("opens previews on the agent's changed workspace without checkout, setup, or reseeding", async () => {
+    const environment = new ProjectEnvironmentService(db, runtime, `file://${remotes}`);
+    const prepared = await environment.prepare({
+      orgId,
+      projectId,
+      workspace,
+      manifest,
+      credentials,
+      branch: "facility/story-environment",
+      cleanSetup: true,
+    });
+    expect(prepared.setupChecksum).toMatch(/^[a-f0-9]{64}$/);
+    const repository = join(workspace.volumeRef, "repos/acme/app");
+    const git = async (args: string[]) => {
+      const result = await runtime.exec(workspace, { command: "git", args, cwd: "repos/acme/app" });
+      expect(result.exitCode, result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    await git(["switch", "-c", "facility/agent-current-work"]);
+    await writeFile(join(repository, "README.md"), "Agent's committed implementation\n");
+    await git(["add", "README.md"]);
+    await git(["commit", "-m", "fix: implement the story"]);
+    const head = await git(["rev-parse", "HEAD"]);
+    await writeFile(join(repository, "uncommitted.txt"), "Work in progress\n");
+    await writeFile(join(repository, ".facility-test/seed"), "user-created-data");
+    await writeFile(join(workspace.volumeRef, ".facility/claude/session.json"), "claude-session");
+    await writeFile(join(workspace.volumeRef, ".facility/codex/session.json"), "codex-session");
+    const setupCount = await readFile(join(repository, ".setup-count"), "utf8");
+    const userId = newId("user");
+    const roleId = newId("role");
+    await db
+      .insert(users)
+      .values({ id: userId, email: `preview-reuse-${suffix}@example.com`, status: "active" });
+    await db.insert(roles).values({
+      id: roleId,
+      orgId,
+      name: `preview-reuse-${suffix}`,
+      permissions: ["workspaces:execute"],
+    });
+    await db.insert(orgMembers).values({ id: newId("member"), orgId, userId, roleId });
+    const previews = new WorkspacePreviewService(
+      db,
+      {
+        publicUrl: "https://api.example.com",
+        previewUrl: "https://preview.example.net",
+      } as AppConfig,
+      runtime,
+      {
+        issue: async () => credentials,
+      } as unknown as GithubWorkspaceCredentialBroker,
+      { load: async () => manifest },
+      environment,
+    );
+
+    for (const sleeping of [false, true]) {
+      if (sleeping) {
+        await runtime.replaceCompute(workspace);
+        await rm(join(repository, ".facility-test/status"));
+        await db
+          .update(workspaces)
+          .set({ state: "sleeping" })
+          .where(eq(workspaces.id, workspaceId));
+      }
+      const originalExec = runtime.exec.bind(runtime);
+      const exec = vi.spyOn(runtime, "exec").mockImplementation(async (locator, command) => {
+        const result = await originalExec(locator, command);
+        // A concurrent preparation may finish after preview open read its checksum.
+        await db
+          .update(workspaces)
+          .set({ setupChecksum: "concurrent-preparation-checksum" })
+          .where(eq(workspaces.id, workspaceId));
+        return result;
+      });
+      try {
+        const opened = await previews.open({ orgId, projectId, storyId, userId, service: "app" });
+        expect(
+          exec.mock.calls.every(
+            ([locator]) => locator.id === workspaceId && locator.volumeRef === workspace.volumeRef,
+          ),
+        ).toBe(true);
+        const scripts = exec.mock.calls.map(([, command]) => {
+          expect(command.command).toBe("sh");
+          return command.args?.[1];
+        });
+        expect(scripts).toEqual(
+          sleeping
+            ? [manifest.environment.ready, manifest.environment.start, manifest.environment.ready]
+            : [manifest.environment.ready],
+        );
+        const token = new URL(opened.url).searchParams.get("token");
+        if (!token) throw new Error("expected one-time preview token");
+        await expect(previews.exchange(opened.sessionId, token)).resolves.toMatchObject({
+          workspaceId,
+        });
+        await expect(previews.exchange(opened.sessionId, token)).rejects.toMatchObject({
+          code: "preview_access_invalid",
+        });
+        await expect(previews.authorize(opened.sessionId, token)).resolves.toMatchObject({
+          workspaceId,
+        });
+      } finally {
+        exec.mockRestore();
+      }
+      expect(await git(["rev-parse", "HEAD"])).toBe(head);
+      expect(await git(["branch", "--show-current"])).toBe("facility/agent-current-work");
+      expect(await readFile(join(repository, "uncommitted.txt"), "utf8")).toBe(
+        "Work in progress\n",
+      );
+      expect(await readFile(join(repository, ".facility-test/seed"), "utf8")).toBe(
+        "user-created-data",
+      );
+      expect(await readFile(join(repository, ".setup-count"), "utf8")).toBe(setupCount);
+      expect(
+        await readFile(join(workspace.volumeRef, ".facility/claude/session.json"), "utf8"),
+      ).toBe("claude-session");
+      expect(
+        await readFile(join(workspace.volumeRef, ".facility/codex/session.json"), "utf8"),
+      ).toBe("codex-session");
+      const persisted = (
+        await db.select().from(workspaces).where(eq(workspaces.id, workspaceId))
+      )[0];
+      expect(persisted).toMatchObject({
+        state: "running",
+        setupChecksum: "concurrent-preparation-checksum",
+      });
+    }
+    await expect(
+      previews.open({ orgId: newId("org"), projectId, storyId, userId, service: "app" }),
+    ).rejects.toMatchObject({ code: "story_not_found" });
+  });
+
+  it("marks successful preparation without a setup script for future preview reuse", async () => {
+    const environment = new ProjectEnvironmentService(db, runtime, `file://${remotes}`);
+    const noSetup = {
+      ...manifest,
+      environment: { ...manifest.environment, setup: undefined, seed: undefined },
+    };
+    const prepared = await environment.prepare({
+      orgId,
+      projectId,
+      workspace,
+      manifest: noSetup,
+      credentials,
+      branch: "facility/story-environment",
+    });
+    const persisted = (await db.select().from(workspaces).where(eq(workspaces.id, workspaceId)))[0];
+    expect(persisted?.setupChecksum).toBe(prepared.setupChecksum);
   });
 
   it("validates declared environment before running setup and injects it ephemerally", async () => {

@@ -65,7 +65,12 @@ Use clean setup when you need to prove that the declared setup works without its
 cache. It may rebuild dependencies or development data, but it does not delete the worktree.
 
 Use browser test to run `environment.browser_test`. Facility sets `FACILITY_ARTIFACT_DIR` and
-retains files written there as story artifacts. Use an authenticated preview to interact with a
+retains files written there as story artifacts. The operation reuses the agent's prepared
+workspace, starts services only when needed, and does not synchronize Git or rerun setup or seed
+when the agent changes HEAD. A missing test command or an unprepared workspace is rejected
+before execution; use clean setup explicitly when preparation is needed.
+
+Use an authenticated preview to interact with a
 declared service from your own browser. Preview sessions are expiring and revocable; they do not
 make the workspace port public.
 

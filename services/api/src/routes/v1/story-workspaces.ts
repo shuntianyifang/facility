@@ -465,43 +465,54 @@ export async function registerStoryWorkspaceRoutes(app: FastifyInstance, config:
         if (bundle.workspace.state === "destroyed") {
           throw new ApiError(409, "workspace_deleted", "Workspace has been deleted");
         }
-        if (!bundle.story.branch) {
-          throw new ApiError(409, "story_branch_missing", "Story branch is not available");
-        }
         const workspaceRow = bundle.workspace;
-        const branch = bundle.story.branch;
-        const [manifest, credentials] = await translate(() =>
-          Promise.all([
-            domain.projectManifests.load(orgId, projectId),
-            domain.credentials.issue(orgId, projectId),
-          ]),
-        );
-        const workspace = workspaceLocator(workspaceRow);
-        await translate(() =>
-          domain.environment.prepare({
+        const manifest = await translate(() => domain.projectManifests.load(orgId, projectId));
+        // Validate before issuing credentials, waking compute, or touching the workspace.
+        if (action === "browser-test" && !manifest.environment.browser_test) {
+          throw new ApiError(
+            409,
+            "browser_test_not_configured",
+            ".facility.yml does not define environment.browser_test",
+          );
+        }
+        let browser: Awaited<ReturnType<typeof domain.environment.runBrowserTest>> | undefined;
+        if (action === "browser-test") {
+          const setupChecksum = workspaceRow.setupChecksum;
+          if (!setupChecksum) {
+            throw new ApiError(
+              409,
+              "workspace_not_prepared",
+              "Prepare the workspace with Clean setup before running a browser test",
+            );
+          }
+          const credentials = await translate(() => domain.credentials.issue(orgId, projectId));
+          const input = {
             orgId,
             projectId,
-            workspace,
+            workspace: workspaceLocator(workspaceRow),
             manifest,
             credentials,
-            branch,
-            previousSetupChecksum: workspaceRow.setupChecksum,
-            cleanSetup: action === "clean-setup",
-          }),
-        );
-        const browser =
-          action === "browser-test"
-            ? await translate(() =>
-                domain.environment.runBrowserTest({
-                  orgId,
-                  projectId,
-                  storyId,
-                  workspace,
-                  manifest,
-                  credentials,
-                }),
-              )
-            : undefined;
+          };
+          await translate(() => domain.environment.startPrepared({ ...input, setupChecksum }));
+          browser = await translate(() => domain.environment.runBrowserTest({ ...input, storyId }));
+        } else {
+          const branch = bundle.story.branch;
+          if (!branch)
+            throw new ApiError(409, "story_branch_missing", "Story branch is not available");
+          const credentials = await translate(() => domain.credentials.issue(orgId, projectId));
+          await translate(() =>
+            domain.environment.prepare({
+              orgId,
+              projectId,
+              workspace: workspaceLocator(workspaceRow),
+              manifest,
+              credentials,
+              branch,
+              previousSetupChecksum: workspaceRow.setupChecksum,
+              cleanSetup: true,
+            }),
+          );
+        }
         return {
           ...storyResponse(await domain.stories.get(orgId, projectId, storyId)),
           ...(browser

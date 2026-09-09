@@ -24,6 +24,7 @@ import type {
   WorkspaceLocator,
   WorkspaceRuntime,
 } from "../workspaces/runtime.js";
+import { reconcileTurnBranch } from "./branch.js";
 
 export type StoryActor = { type: "user" | "service" | "system"; id: string };
 
@@ -400,7 +401,10 @@ export class StoryWorkspaceService {
       const turn = await scopedTurn(tx, input.orgId, input.projectId, input.turnId);
       await lockStory(tx, input.orgId, input.projectId, turn.storyId);
       const story = await scopedStory(tx, input.orgId, input.projectId, turn.storyId);
-      if (turn.state === "succeeded") return turn;
+      if (turn.state === "succeeded") {
+        await reconcileTurnBranch(tx, story, turn);
+        return turn;
+      }
       if (!["queued", "running"].includes(turn.state)) {
         throw new StoryServiceError("turn_not_active", "turn is not active");
       }
@@ -433,6 +437,7 @@ export class StoryWorkspaceService {
         })
         .where(and(eq(stories.orgId, input.orgId), eq(stories.id, turn.storyId)));
       if (!completed) throw new StoryServiceError("turn_not_found", "completed turn not found");
+      await reconcileTurnBranch(tx, story, completed);
       return completed;
     });
   }

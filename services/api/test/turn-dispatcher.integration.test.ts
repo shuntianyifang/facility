@@ -113,6 +113,7 @@ environment:
     readonly name = "codex" as const;
     requests: AgentTurnRequest[] = [];
     outputOverride?: string;
+    renameNextBranch?: string;
     corruptResumeOnce = false;
     replacementPending = false;
     blockUntilCanceled = false;
@@ -152,6 +153,16 @@ environment:
           this.observedCancellation = true;
         }
         throw error;
+      }
+      if (this.renameNextBranch) {
+        const branch = this.renameNextBranch;
+        this.renameNextBranch = undefined;
+        const renamed = await runtime.exec(request.workspace, {
+          command: "git",
+          args: ["branch", "-m", branch],
+          cwd: request.cwd,
+        });
+        if (renamed.exitCode !== 0) throw new Error("branch rename failed");
       }
       const secret = request.environment?.GH_TOKEN ?? "missing";
       const projectSecret = request.environment?.FACILITY_DISPATCH_SECRET ?? "missing";
@@ -229,6 +240,7 @@ environment:
       storiesService,
       new AgentCatalogService(db, catalogSource),
       new GithubWorkspaceCredentialBroker(db, async () => ({
+        gitIdentity: { name: "my-app[bot]", email: "12345+my-app[bot]@users.noreply.github.com" },
         token: "secret-installation-token",
         expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       })),
@@ -816,6 +828,55 @@ environment:
         (message) => message.body,
       ),
     ).toEqual(expect.arrayContaining(["Persist this message before the engine starts"]));
+  });
+
+  it("keeps the agent's renamed branch and native workspace on the next turn", async () => {
+    const branch = `chore/retained-${randomUUID()}`;
+    const started = await storiesService.start({
+      orgId,
+      projectId,
+      provider: "github",
+      externalId: `rename-${randomUUID()}`,
+      title: "Follow repository branch rules",
+      agent: builder,
+      message: "Rename the branch",
+      messageDedupeKey: randomUUID(),
+      actor: { type: "user", id: "test" },
+      workspace: { image: "facility-runner:test", ports: [] },
+    });
+    if (!started.queued.turn) throw new Error("missing turn");
+    engine.renameNextBranch = branch;
+    await expect(
+      dispatcher.dispatch({ orgId, projectId, turnId: started.queued.turn.id }),
+    ).resolves.toMatchObject({ state: "succeeded" });
+    expect((await storiesService.get(orgId, projectId, started.story.id)).story.branch).toBe(
+      branch,
+    );
+    const firstRequest = engine.requests.at(-1);
+    if (!firstRequest) throw new Error("missing request");
+    const next = await storiesService.queueMessage({
+      orgId,
+      projectId,
+      storyId: started.story.id,
+      body: "Continue on the same branch",
+      dedupeKey: randomUUID(),
+      agent: builder,
+      actor: { type: "user", id: "test" },
+      trigger: { type: "manual" },
+    });
+    if (!next.turn) throw new Error("missing next turn");
+    await expect(
+      dispatcher.dispatch({ orgId, projectId, turnId: next.turn.id }),
+    ).resolves.toMatchObject({ state: "succeeded" });
+    const request = engine.requests.at(-1);
+    expect(request?.workspace.id).toBe(firstRequest.workspace.id);
+    expect(request?.nativeSessionId).toBe("codex-native-session");
+    const actual = await runtime.exec(firstRequest.workspace, {
+      command: "git",
+      args: ["branch", "--show-current"],
+      cwd: firstRequest.cwd,
+    });
+    expect(actual.stdout.trim()).toBe(branch);
   });
 });
 

@@ -102,6 +102,12 @@ removing a repository stops future credentials and reconciliation; it does not e
 Facility conversations or workspace files. Treat retained clones and local credentials according
 to your incident and retention policy.
 
+Workspace commits use the configured App's bot identity, including its GitHub user ID in the
+`ID+APP[bot]@users.noreply.github.com` address. Facility verifies this identity with GitHub and
+configures it when preparing new or retained repositories. This lets GitHub associate automated
+commits with the App so deployment integrations can recognize their author. Existing commits are
+not rewritten. If the identity lookup fails, preparation fails instead of using an invented email.
+
 ## Validate the integration
 
 Before production use:

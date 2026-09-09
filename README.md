@@ -183,7 +183,12 @@ Secret names are committed in `.facility.yml`; their values come from the operat
 environment and are injected only while setup, services, or agents run. Use the provider variable
 names supported by the selected Claude Code and Codex authentication method.
 Declared services are available through short-lived, authenticated preview sessions routed to the
-live workspace. Facility does not build a second preview deployment.
+live workspace. Facility does not build a second preview deployment. Once the story workspace is
+prepared, opening a preview uses the agents' current branch, uncommitted files, and local data.
+With `environment.ready` declared, it reuses healthy services and starts them only when needed.
+Without a readiness command, it runs the declared start command on each open. Neither path fetches
+or switches Git, reruns setup, or reseeds. Use the explicit **Clean setup** action when a setup
+reset is required, including when repository or setup changes need to be applied.
 
 ## MCP surface
 

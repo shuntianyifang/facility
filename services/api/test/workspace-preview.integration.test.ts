@@ -127,6 +127,7 @@ describe("workspace preview session security", async () => {
       externalRef: `fake:${workspaceId}`,
       volumeRef: `fake-volume:${workspaceId}`,
       state: "running",
+      setupChecksum: "prepared-workspace-checksum",
       environment: {
         image: "facility-runner:test",
         variables: { FACILITY_PREVIEW_GATEWAY_TOKEN: gatewayToken },
@@ -160,7 +161,7 @@ describe("workspace preview session security", async () => {
       }),
     } as ProjectManifestSource;
     const environment = {
-      prepare: async () => ({ endpoints: [endpoint], primaryCwd: "repos/theam/example" }),
+      startPrepared: async () => ({ endpoints: [endpoint], primaryCwd: "repos/theam/example" }),
     } as unknown as ProjectEnvironmentService;
     service = new WorkspacePreviewService(db, config, runtime, credentials, manifests, environment);
   });

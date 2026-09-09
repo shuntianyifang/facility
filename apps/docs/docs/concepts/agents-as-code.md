@@ -34,6 +34,12 @@ assume a read-oriented agent has read-only credentials.
 The catalog is loaded from a specific Git commit and cached with content hashes. A turn snapshots
 the parsed manifest, so later repository edits do not rewrite execution history.
 
+Refreshes check repository access and the current branch commit. Concurrent reads of the same
+commit reuse a complete snapshot scoped to that project, repository, and GitHub installation.
+Only agent manifests and `SKILL.md` files are downloaded. A failed or incomplete refresh preserves
+the last valid catalog; successfully reading a commit that removes definitions removes them from
+the catalog.
+
 The default kickstart catalog includes `architect`, `builder`, `pr-reviewer`, `address-review`,
 `ci-doctor`, and `security-audit`. They are ordinary manifests rather than built-in runtime roles.
 You can edit, disable, or replace them and add more `.md` files using the same schema.

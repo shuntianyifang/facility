@@ -25,7 +25,7 @@ import {
 } from "@facility/db";
 import { and, eq } from "drizzle-orm";
 import postgres from "postgres";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { GithubMirrorService, restCiSignal, webhookCiSignal } from "../src/github/mirror.js";
 import { GithubPipelineService } from "../src/github/pipeline.js";
 import { BudgetPolicyError, CostBudgetService } from "../src/insights/costs.js";
@@ -508,6 +508,60 @@ describe("cost controls, GitHub mirror, and pipeline", async () => {
         }),
       ]),
     );
+  });
+
+  it("does not repeatedly fetch terminal CI for unchanged closed history", async () => {
+    const pulls = [
+      { number: 801, state: "closed", sha: "8".repeat(40) },
+      { number: 802, state: "open", sha: "9".repeat(40) },
+    ];
+    const request = vi.fn(async (route: string) => {
+      if (route.endsWith("/branches") || route.endsWith("/issues") || route.endsWith("/reviews"))
+        return { data: [] };
+      if (route.endsWith("/pulls"))
+        return {
+          data: pulls.map((pull) => ({
+            number: pull.number,
+            title: "Reconcile CI",
+            state: pull.state,
+            html_url: `https://github.com/acme/app/pull/${pull.number}`,
+            head: { ref: `work/${pull.number}`, sha: pull.sha },
+            base: { ref: "main" },
+            updated_at: "2026-09-01T10:00:00Z",
+          })),
+        };
+      if (route.endsWith("/status")) return { data: { state: "success", statuses: [] } };
+      if (route.endsWith("/check-runs")) return { data: { check_runs: [] } };
+      throw new Error(`unexpected route ${route}`);
+    });
+    const mirror = new GithubMirrorService(db, async () => ({ request, rest: {} as never }));
+    const ciRequests = () =>
+      request.mock.calls.filter(
+        ([route]) => route.endsWith("/status") || route.endsWith("/check-runs"),
+      ).length;
+    await mirror.syncProject(orgId, projectId);
+    expect(ciRequests()).toBe(4);
+    request.mockClear();
+    await mirror.syncProject(orgId, projectId);
+    expect(ciRequests()).toBe(2);
+    const closed = (
+      await db
+        .select()
+        .from(githubPullRequests)
+        .where(
+          and(
+            eq(githubPullRequests.repositoryId, repositoryId),
+            eq(githubPullRequests.number, 801),
+          ),
+        )
+    )[0];
+    expect(closed).toMatchObject({ ciState: "success", ciHeadSha: pulls[0]?.sha });
+    const closedPull = pulls[0];
+    if (!closedPull) throw new Error("expected closed pull fixture");
+    closedPull.sha = "7".repeat(40);
+    request.mockClear();
+    await mirror.syncProject(orgId, projectId);
+    expect(ciRequests()).toBe(4);
   });
 
   it("recognizes reconciled merged pull requests from merged_at without a merged boolean", async () => {

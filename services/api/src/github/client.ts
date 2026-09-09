@@ -1,6 +1,7 @@
 import { App } from "@octokit/app";
 import { Octokit as RestOctokit } from "@octokit/rest";
 import type { AppConfig } from "../types.js";
+import { createGithubGitIdentityLoader, type GithubGitIdentity } from "./git-identity.js";
 
 export type Octokit = {
   request?: (route: string, args?: Record<string, unknown>) => Promise<{ data: unknown }>;
@@ -48,6 +49,7 @@ export type GithubMaintainerTokenFactory = (input: {
 }) => Promise<{
   token: string;
   expiresAt: string;
+  gitIdentity: GithubGitIdentity;
 }>;
 
 export function createGithubClientFactory(config: AppConfig): GithubClientFactory {
@@ -75,6 +77,17 @@ export function createGithubMaintainerTokenFactory(
     throw new Error("GitHub App credentials are not configured");
   }
   const app = new App({ appId: config.githubAppId, privateKey: config.githubAppPrivateKey });
+  const identityClient = new RestOctokit();
+  const identity = createGithubGitIdentityLoader({
+    app: async () => (await app.octokit.request("GET /app")).data ?? {},
+    user: async (username, token) =>
+      (
+        await identityClient.request("GET /users/{username}", {
+          username,
+          headers: { authorization: `Bearer ${token}` },
+        })
+      ).data,
+  });
   return async ({ installationId, repositories }) => {
     const response = await app.octokit.request(
       "POST /app/installations/{installation_id}/access_tokens",
@@ -90,7 +103,7 @@ export function createGithubMaintainerTokenFactory(
     ) {
       throw new Error("GitHub installation token response omitted an exact expiry");
     }
-    return { token, expiresAt };
+    return { token, expiresAt, gitIdentity: await identity(token) };
   };
 }
 

@@ -138,7 +138,8 @@ export class GithubMirrorService {
         direction: "desc",
       });
       for (const pull of pullScan.rows) {
-        if (await this.upsertPullRequest(repository, pull)) pullRequests += 1;
+        const saved = await this.upsertPullRequest(repository, pull);
+        if (saved) pullRequests += 1;
         const pullNumber = positiveInteger(pull.number);
         const headSha = string(object(pull.head).sha);
         if (pullNumber && (await this.linkedStory(repository, { pullNumber, headSha }))) {
@@ -151,7 +152,7 @@ export class GithubMirrorService {
             reviews += await this.upsertReview(repository, review, pullNumber, headSha);
           }
         }
-        if (headSha) {
+        if (headSha && saved && shouldRefreshPullRequestCi(saved)) {
           const refreshed = await this.refreshCi(repository, client, pull);
           ciUpdates += refreshed.ciUpdates;
           checks += refreshed.checks;
@@ -984,6 +985,25 @@ export class GithubMirrorService {
       )
       .then((rows) => rows.map((row) => row.number));
   }
+}
+
+export function shouldRefreshPullRequestCi(pull: {
+  state: string;
+  headSha: string;
+  ciHeadSha: string | null;
+  ciState: string | null;
+  githubUpdatedAt: Date | null;
+  ciUpdatedAt: Date | null;
+}): boolean {
+  // Closed history with current, terminal CI is already reconciled. Open,
+  // changed, and unfinished pulls still refresh, as do later webhook signals.
+  return (
+    pull.state === "open" ||
+    pull.ciHeadSha !== pull.headSha ||
+    (pull.ciState !== "success" && pull.ciState !== "failure") ||
+    !pull.ciUpdatedAt ||
+    Boolean(pull.githubUpdatedAt && pull.githubUpdatedAt > pull.ciUpdatedAt)
+  );
 }
 
 async function paginated(

@@ -72,6 +72,22 @@ The runtime provider implements create, wake, execute, expose, inspect, suspend,
 Docker workspace uses a named volume independent of its replaceable container. Vercel uses durable
 snapshot-backed state while renewing finite compute leases.
 
+When a Vercel workspace resumes, Docker startup distinguishes a live daemon from a stale PID file
+retained in the snapshot. It waits for a live daemon, or removes stale PID and socket files before
+starting one. A recycled PID is never signaled. Bootstrap preserves ownership inside Docker layers
+and volumes so container data survives the resume.
+
+New daemons use an execution-state directory tied to the kernel boot ID. Restoring a snapshot
+therefore cannot reuse runc process state from an earlier VM, while Docker's persistent data stays
+in `/workspace/.facility/docker`. Container restart policies still apply: a container deliberately
+stopped with `unless-stopped` remains stopped. A missing or malformed boot ID prevents startup.
+
+Vercel agent commands start once and are tracked by bounded completion requests to the same command
+while their output streams. Each wait is limited to 30 seconds; an expired wait is renewed
+without restarting the command. Tracking does not hold one HTTP request open for the entire
+agent run, so a long command can finish within its configured provider timeout. Cancel still
+signals the existing command; a failed status or output read is reported without resubmitting it.
+
 ## Operations
 
 ### Send message
@@ -88,6 +104,15 @@ or external GitHub effects that already occurred.
 
 Retry asks Facility to attempt recoverable work again. Dismiss closes an obsolete attention item.
 A waiting-agent item is normally resolved by a user reply.
+
+### Open preview
+
+Opens the service in the same persistent workspace used by the story's agents. Once prepared,
+preview access preserves the current Git branch, uncommitted files, native sessions, and local
+data. It does not fetch or switch Git, rerun setup, or reseed. A declared `environment.ready`
+command lets Facility reuse healthy services; otherwise it runs `environment.start` on each open.
+A sleeping workspace wakes with its retained files. First-time preparation still runs normally;
+use **Clean setup** to apply repository or setup changes that require preparation again.
 
 ### Clean setup
 
@@ -128,3 +153,8 @@ Facility does not automatically delete workspaces after merge, archive, error, o
 Operators must monitor active compute and retained storage, define backup and retention rules, and
 use deletion deliberately. Project budgets and cost views support that decision but do not turn
 unknown provider pricing into zero.
+
+Vercel resume removes stale Docker/containerd runtime files only when the recorded
+Docker daemon is absent. A retained preview PID is signaled only when its command
+line matches the gateway and both ports. Docker readiness failures identify the
+retained daemon log. Existing container-file ownership is preserved, not repaired.

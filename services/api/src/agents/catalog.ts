@@ -18,6 +18,7 @@ import {
 import { and, asc, eq, notInArray, sql } from "drizzle-orm";
 import { FacilityGithubClient, type GithubClientFactory } from "../github/client.js";
 import { readRepoFiles } from "../github/repo-files.js";
+import { isAgentManifestPath, isProjectSkillPath, readAgentCatalogFiles } from "./catalog-files.js";
 
 export type AgentCatalogSnapshot = {
   commitSha: string;
@@ -61,6 +62,9 @@ export class AgentCatalogError extends Error {
 
 /** Reads the canonical .agents directory from the project's primary repository. */
 export class GithubAgentCatalogSource implements AgentCatalogSource {
+  // Immutable commit snapshots, shared by concurrent readers and bounded per API process.
+  private readonly snapshots = new Map<string, Promise<AgentCatalogSnapshot>>();
+
   constructor(
     private readonly db: FacilityDb,
     private readonly factory: GithubClientFactory,
@@ -107,16 +111,46 @@ export class GithubAgentCatalogSource implements AgentCatalogSource {
         defaultBranch: repository.defaultBranch,
       });
       const commitSha = await client.getDefaultBranchSha();
-      const files = await readRepoFiles(client, commitSha, [".agents", ".claude/skills"]);
-      const sources = [...files.entries()]
-        .filter(([path]) => /^\.agents\/[a-z0-9]+(?:-[a-z0-9]+)*\.md$/.test(path))
-        .map(([file, source]) => ({ file, source }))
-        .sort((left, right) => left.file.localeCompare(right.file));
-      const skills = [...files.entries()]
-        .filter(([path]) => /^\.(?:agents|claude)\/skills\/(?:[^/]+\/)*SKILL\.md$/.test(path))
-        .map(([file, source]) => ({ file, source }))
-        .sort((left, right) => left.file.localeCompare(right.file));
-      return { commitSha, sources, skills };
+      // Authorization and the current ref are checked before every cache read. A changed
+      // repository, installation, or tenant can never reuse another scope's snapshot.
+      const key = JSON.stringify([
+        orgId,
+        projectId,
+        repository.id,
+        installation.installationId,
+        repository.owner,
+        repository.name,
+        repository.defaultBranch,
+        commitSha,
+      ]);
+      let snapshot = this.snapshots.get(key);
+      if (!snapshot) {
+        snapshot = readAgentCatalogFiles(client, commitSha).then((files) => {
+          const entries = [...files.entries()];
+          const sources = entries
+            .filter(([path]) => isAgentManifestPath(path))
+            .map(([file, source]) => ({ file, source }))
+            .sort((left, right) => left.file.localeCompare(right.file));
+          const skills = entries
+            .filter(([path]) => isProjectSkillPath(path))
+            .map(([file, source]) => ({ file, source }))
+            .sort((left, right) => left.file.localeCompare(right.file));
+          return { commitSha, sources, skills };
+        });
+      }
+      this.snapshots.delete(key);
+      this.snapshots.set(key, snapshot);
+      if (this.snapshots.size > 100) {
+        const oldest = this.snapshots.keys().next().value;
+        if (oldest !== undefined) this.snapshots.delete(oldest);
+      }
+      try {
+        return structuredClone(await snapshot);
+      } catch (error) {
+        // Failures must be retried, and must not erase the last complete DB projection.
+        if (this.snapshots.get(key) === snapshot) this.snapshots.delete(key);
+        throw error;
+      }
     } catch (error) {
       if (error instanceof AgentCatalogError) throw error;
       throw new AgentCatalogError(

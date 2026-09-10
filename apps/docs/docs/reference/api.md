@@ -49,6 +49,41 @@ at creation; store it as a secret.
 Repository connections are organization- and installation-bound. A project-scoped key requesting
 another project receives 404 rather than a distinguishable authorization error.
 
+### Disconnect a repository
+
+`DELETE /v1/projects/:projectId/repos/:repoId` requires `repos:write` and returns
+`200 { "ok": true }`. It is a scoped no-op if that connection is already absent;
+send `Idempotency-Key` to replay the same request safely. It never deletes or
+modifies the upstream GitHub repository, branches, issues or pull requests.
+
+The transaction removes the connection and its derived GitHub mirror rows:
+issues, PRs, branches, reviews, checks and CI events. Webhook receipts retain their
+payload and project attribution but lose the repository reference; pending receipts
+are marked processed with `repository_disconnected`. Bound receipt processing keeps
+the original project and repository IDs through mirror and trigger lookups, so
+queued, replayed or in-flight deliveries cannot target a later connection. Detached
+receipts are ignored without overwriting their cancellation state. The `repo.removed` audit event
+continues to record the operation. Reconnecting and synchronizing rebuilds current
+GitHub data, not necessarily every historical CI observation.
+
+Removing a primary promotes the oldest remaining connection (ID breaks creation-time
+ties). Removing the sole connection leaves an empty project. No placeholder is
+required. Update the primary's `.facility.yml` and agent catalog before new work.
+
+`409 repository_in_use` leaves all data unchanged when the repository has any
+retained Facility story (including archived history), the project has any workspace
+not in `destroyed` state, or another foreign-key dependency remains. Workspaces can
+contain related checkouts even without a story directly referencing that repository.
+Resolve their lifecycle or arrange an explicit history migration; this endpoint
+never removes conversations, turns, artifacts or volumes. Project archival alone
+does not resolve these dependencies. This is not a history-transfer endpoint.
+
+Readers receive 403. Project-scoped keys cannot use another project, and an ID
+belonging to a different project is never deleted. The route/body schema and
+permission are unchanged; no database migration or additional provider credentials
+are required. Unlink does not revoke already issued GitHub tokens or App access;
+credential revocation remains a separate operator action.
+
 ## Agents and stories
 
 - `/v1/projects/:projectId/story-agents` lists the catalog and schedule status.

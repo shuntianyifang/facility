@@ -236,6 +236,7 @@ test("workspace CI runs the persistent Docker acceptance path", () => {
 });
 
 test("runner Go binaries resolve the fixed cryptography and gRPC modules", () => {
+  assert.doesNotMatch(runnerDockerfile, /google\.golang\.org\/grpc@v1\.83\.1/);
   assert.doesNotMatch(runnerDockerfile, /golang\.org\/x\/crypto@v0\.55\.0/);
   assert.match(
     runnerDockerfile,

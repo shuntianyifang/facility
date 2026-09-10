@@ -3,6 +3,7 @@
 import { Button } from "@facility/ui";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
+import { requestCompose } from "@/components/story/story-conversation";
 import type { WorkspaceStoryBundle } from "@/lib/api";
 import { clientApi } from "@/lib/client-api";
 
@@ -12,11 +13,14 @@ export function AttentionActions({
   projectId,
   storyId,
   item,
+  agentName,
   replyAnchor = true,
 }: {
   projectId: string;
   storyId: string;
   item: AttentionItem;
+  /** The agent that asked, so the composer opens addressed to it. */
+  agentName?: string | null;
   /** The story page has the composer on the same page; other surfaces link to it themselves. */
   replyAnchor?: boolean;
 }) {
@@ -44,12 +48,9 @@ export function AttentionActions({
     <div className="mt-3 flex flex-wrap items-center gap-2">
       {item.kind === "agent_waiting" ? (
         replyAnchor ? (
-          <a
-            href="#story-composer"
-            className="text-[11.5px] text-(--info) underline-offset-4 hover:underline"
-          >
-            Reply below
-          </a>
+          <Button size="sm" onClick={() => requestCompose(agentName ?? undefined)}>
+            reply
+          </Button>
         ) : null
       ) : item.turnId ? (
         <Button size="sm" onClick={() => act("retry")} disabled={Boolean(pending)}>

@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 
 test("real API retains workspace files and sessions through UI lifecycle and deletes only on confirmation", async ({
   page,
@@ -17,26 +17,29 @@ test("real API retains workspace files and sessions through UI lifecycle and del
   const files = async () =>
     (await request.get(`http://127.0.0.1:4492/__fixture/${fixture.fixtureId}/files`)).json();
   await page.goto(`/projects/${fixture.projectId}/stories`);
-  await page.getByLabel("Story title").fill("Real lifecycle journey");
-  await page.getByLabel("First message").fill("Create durable state");
-  await page.getByRole("button", { name: "start story", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Real lifecycle journey" })).toBeVisible();
+  await page.getByLabel("What do you need?").fill("Create durable state");
+  await page.getByRole("button", { name: "Start story", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Create durable state" })).toBeVisible();
   const before = await files();
   expect(before.files).toEqual([
     "retained:untracked.txt",
     "retained:.facility/claude/session",
     "retained:.facility/codex/session",
   ]);
+  await openMaintenance(page);
   await page.getByRole("button", { name: "suspend compute" }).click();
-  await expect(page.locator("dd").filter({ hasText: /^sleeping$/ })).toBeVisible();
+  await expect(page.locator("dd").filter({ hasText: /^Suspended$/ })).toBeVisible();
   expect((await files()).files).toEqual(before.files);
+  await page.getByRole("button", { name: "send a task", exact: true }).click();
   await page.getByLabel("Message", { exact: true }).fill("Resume with the same files");
   await page.getByRole("button", { name: "send to agent" }).click();
-  await expect(page.locator("dd").filter({ hasText: /^running$/ })).toBeVisible();
+  await expect(page.locator("dd").filter({ hasText: /^Machine on$/ })).toBeVisible();
+  await openMaintenance(page);
   await page.getByRole("button", { name: "archive", exact: true }).click();
   await expect(page.getByRole("button", { name: "restore", exact: true })).toBeVisible();
   expect((await files()).files).toEqual(before.files);
   await page.reload();
+  await openMaintenance(page);
   await page.getByRole("button", { name: "restore", exact: true }).click();
   await expect(page.getByRole("button", { name: "archive", exact: true })).toBeVisible();
   expect(await files()).toMatchObject({
@@ -44,6 +47,7 @@ test("real API retains workspace files and sessions through UI lifecycle and del
     volumeRef: before.volumeRef,
     files: before.files,
   });
+  await openMaintenance(page);
   await page.getByText("Permanently delete workspace", { exact: true }).click();
   const remove = page.getByRole("button", { name: "delete workspace", exact: true });
   await expect(remove).toBeDisabled();
@@ -57,9 +61,20 @@ test("real API retains workspace files and sessions through UI lifecycle and del
     page.getByText("This workspace was permanently deleted.", { exact: false }),
   ).toBeVisible();
   expect(await files()).toMatchObject({ state: "destroyed", files: [null, null, null] });
-  await expect(page.getByText("Create durable state", { exact: true })).toBeVisible();
+  await expect(
+    page.locator("#conversation").getByText("Create durable state", { exact: true }),
+  ).toBeVisible();
   await page.reload();
   await expect(
-    page.getByRole("button", { name: /^(restore|suspend compute|archive|send to agent)$/ }),
+    page.getByRole("button", {
+      name: /^(restore|suspend compute|archive|send to agent|send a task)$/,
+    }),
   ).toHaveCount(0);
 });
+
+async function openMaintenance(page: Page) {
+  const summary = page.locator("summary").filter({ hasText: /^maintenance/ });
+  if (!(await summary.evaluate((element) => element.parentElement?.hasAttribute("open")))) {
+    await summary.click();
+  }
+}

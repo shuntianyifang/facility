@@ -11,7 +11,13 @@ let bundle;
 let messages;
 let requests;
 let failure;
-const agent = { name: "builder", enabled: true, engine: "codex", model: "fixture-model" };
+const agent = {
+  name: "builder",
+  enabled: true,
+  engine: "codex",
+  model: "fixture-model",
+  triggers: [{ type: "ui" }],
+};
 
 function reset(options = {}) {
   permissions = options.permissions ?? [
@@ -27,6 +33,9 @@ function reset(options = {}) {
       provider: "manual",
       externalId: "ui-fixture",
       title: "Persistent UI story",
+      titleSource: "request",
+      createdAt: timestamp,
+      updatedAt: timestamp,
       status: "ready",
       deletedAt: null,
       activeAgentName: null,
@@ -42,6 +51,7 @@ function reset(options = {}) {
       environment: { image: "fixture", ports: [] },
     },
     attention: [],
+    assignees: [],
     timeline: [],
     turns: [],
     artifacts: [],
@@ -74,17 +84,59 @@ createServer(async (req, res) => {
   if (path === "/__state") return reply({ bundle, messages, requests });
   if (path === "/v1/me")
     return reply({
-      principal: { email: "fixture@example.test" },
+      principal: { id: "fixture", userId: "fixture", email: "fixture@example.test" },
       org: { name: "Fixture" },
       permissions,
     });
   if (path === "/v1/projects") return reply([project]);
   if (path === `/v1/projects/${project.id}`) return reply(project);
-  if (path === `/v1/projects/${project.id}/story-agents`) return reply({ agents: [agent] });
+  if (path === `/v1/projects/${project.id}/story-agents`)
+    return reply({
+      agents: [agent],
+      defaults: { ui: "builder", manual: "builder", mcp: "builder" },
+      title_generation: false,
+    });
+  if (path === `/v1/projects/${project.id}/backlog`)
+    return reply({
+      items: [
+        {
+          key: "story:story_ui",
+          kind: "story",
+          title: bundle.story.title,
+          titleSource: "request",
+          phase: bundle.story.status === "archived" ? "archived" : "not_started",
+          reason: "ready",
+          activity: { state: "idle", agentName: null, engine: null, turnId: null, since: null },
+          environment: { recordedState: bundle.workspace.state, lastActivityAt: timestamp },
+          attention: [],
+          story: bundle.story,
+          issue: null,
+          pullRequest: null,
+          labels: [],
+          assignees: [],
+          createdAt: timestamp,
+          lastActivityAt: timestamp,
+        },
+      ],
+      total: 1,
+      limit: 50,
+      offset: 0,
+      generatedAt: timestamp,
+      counts: {
+        not_started: bundle.story.status === "archived" ? 0 : 1,
+        in_progress: 0,
+        attention: 0,
+        review: 0,
+        done: 0,
+        archived: bundle.story.status === "archived" ? 1 : 0,
+      },
+      facets: { labels: [], assignees: [], repositories: [], unassigned: 0 },
+    });
   if (req.method === "GET") {
     if (path === base) return reply({ stories: [bundle.story] });
     if (path === `${base}/story_ui`) return reply(bundle);
-    if (path === `${base}/story_ui/conversation`) return reply({ messages });
+    if (path === `${base}/story_ui/conversation`)
+      return reply({ messages, related: [], has_more: false, next_cursor: null });
     if (path === `${base}/story_ui/environment`)
       return reply({
         workspace: bundle.workspace,
@@ -113,9 +165,15 @@ createServer(async (req, res) => {
     return reply({ error: { message: "Fixture operation failed; retry is safe." } }, status);
   }
   if (req.method === "POST" && (path === base || path === `${base}/story_ui/messages`)) {
-    if (path === base) bundle.story.title = body.title;
+    if (path === base) bundle.story.title = body.title ?? body.message.split("\n")[0];
     messages.push({
       id: `message_${messages.length}`,
+      seq: messages.length + 1,
+      author: { kind: "user", name: "Fixture user", handle: null, avatarUrl: null },
+      turn: null,
+      turnId: null,
+      requestedAgentName: "builder",
+      content: { kind: "text", progressMessages: null, reportedModel: null },
       role: "user",
       body: body.message,
       createdAt: timestamp,

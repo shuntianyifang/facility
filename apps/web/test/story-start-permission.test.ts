@@ -5,14 +5,33 @@ import ProjectStoriesPage from "../app/(app)/projects/[projectId]/stories/page";
 const fixture = vi.hoisted(() => ({ permissions: [] as string[] }));
 vi.mock("@/lib/api", () => ({
   api: {
-    workspaceStories: async () => ({ ok: true, data: { stories: [] } }),
-    storyAgents: async () => ({ ok: true, data: { agents: [{ name: "builder", enabled: true }] } }),
-    me: async () => ({ ok: true, data: { permissions: fixture.permissions } }),
+    projectBacklog: async () => ({
+      ok: true,
+      data: {
+        items: [],
+        total: 0,
+        counts: { not_started: 0, in_progress: 0, attention: 0, review: 0, done: 0, archived: 0 },
+        facets: { labels: [], assignees: [], repositories: [], unassigned: 0 },
+      },
+    }),
+    storyAgents: async () => ({
+      ok: true,
+      data: {
+        agents: [{ name: "builder", enabled: true, engine: "codex", triggers: [{ type: "ui" }] }],
+        defaults: { ui: "builder" },
+        title_generation: false,
+      },
+    }),
+    me: async () => ({
+      ok: true,
+      data: { permissions: fixture.permissions, principal: { id: "viewer" } },
+    }),
   },
 }));
-vi.mock("@/components/story/start-workspace-story", () => ({
-  StartWorkspaceStory: () => "START_STORY",
+vi.mock("@/components/story/new-story", () => ({
+  NewStory: () => "START_STORY",
 }));
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push() {}, refresh() {} }) }));
 vi.mock("@/components/shell/live-refresh", () => ({ LiveRefresh: () => null }));
 
 describe("story creation permission", () => {

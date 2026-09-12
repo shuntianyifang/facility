@@ -1,6 +1,7 @@
 import { Divider, Eyebrow, PillTag } from "@facility/ui";
 import Link from "next/link";
 import { ErrorNotice, Offline } from "@/components/offline";
+import { DisconnectRepository } from "@/components/project/disconnect-repository";
 import { WorkspaceVariables } from "@/components/story/workspace-variables";
 import { api } from "@/lib/api";
 import { can } from "@/lib/permissions";
@@ -58,7 +59,7 @@ export default async function ProjectSettingsPage({
           </p>
         ) : (
           <div className="flex flex-col border border-(--line)">
-            {repos.data.map((repo, index) => (
+            {repos.data.map((repo) => (
               <div
                 key={repo.id}
                 className="flex flex-wrap items-center gap-3 border-b border-(--line) px-5 py-4 last:border-0"
@@ -71,10 +72,15 @@ export default async function ProjectSettingsPage({
                 >
                   {repo.owner}/{repo.name}
                 </a>
-                <PillTag>{index === 0 ? "primary" : "related"}</PillTag>
+                <PillTag>{repo.role}</PillTag>
                 <span className="ml-auto font-mono text-[11px] text-(--dim)">
                   {repo.defaultBranch}
                 </span>
+                <DisconnectRepository
+                  projectId={projectId}
+                  repository={repo}
+                  canWrite={can(me.ok ? me.data.permissions : [], "repos:write")}
+                />
               </div>
             ))}
           </div>

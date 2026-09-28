@@ -167,6 +167,8 @@ export class StoryWorkspaceService {
           "this story's workspace was explicitly deleted; start a new story identity",
         );
       }
+      await lockStory(tx, input.orgId, input.projectId, story.id);
+      await this.assertWorkspaceNotDeleting(tx, input.orgId, input.projectId, story.id);
       await recordParticipation(tx, story, input.actor);
 
       let conversation = (
@@ -333,6 +335,7 @@ export class StoryWorkspaceService {
       if (story.deletedAt) {
         throw new StoryServiceError("story_workspace_deleted", "story workspace was deleted");
       }
+      await this.assertWorkspaceNotDeleting(tx, input.orgId, input.projectId, input.storyId);
       const conversation = (
         await tx
           .select()
@@ -717,6 +720,16 @@ export class StoryWorkspaceService {
       const tx = rawTx as unknown as FacilityDb;
       await lockStory(tx, input.orgId, input.projectId, input.storyId);
       const story = await scopedStory(tx, input.orgId, input.projectId, input.storyId);
+      // A late queue callback must not create a retry notice for deleted work.
+      const workspace = await this.activeWorkspace(
+        input.orgId,
+        input.projectId,
+        input.storyId,
+        true,
+        tx,
+      );
+      if (story.deletedAt || workspace?.state === "deleting" || workspace?.state === "destroyed")
+        return undefined;
       await tx
         .update(stories)
         .set({
@@ -959,6 +972,14 @@ export class StoryWorkspaceService {
     const turn = await this.db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as FacilityDb;
       await lockStory(tx, input.orgId, input.projectId, input.storyId);
+      const workspace = await this.activeWorkspace(
+        input.orgId,
+        input.projectId,
+        input.storyId,
+        true,
+        tx,
+      );
+      if (!workspace || ["deleting", "destroyed"].includes(workspace.state)) return undefined;
       const active = (
         await tx
           .select()
@@ -1765,27 +1786,73 @@ export class StoryWorkspaceService {
         400,
       );
     }
-    const workspace = await this.activeWorkspace(input.orgId, input.projectId, input.storyId, true);
-    if (!workspace || workspace.state === "destroyed") {
-      return this.get(input.orgId, input.projectId, input.storyId);
-    }
-    await this.db.transaction(async (rawTx) => {
+    const workspace = await this.db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as FacilityDb;
       await lockStory(tx, input.orgId, input.projectId, input.storyId);
+      const workspace = await this.activeWorkspace(
+        input.orgId,
+        input.projectId,
+        input.storyId,
+        true,
+        tx,
+      );
+      if (!workspace || workspace.state === "destroyed") return undefined;
+      // Lock the same rows dispatch claims with UPDATE. Whichever operation wins
+      // determines whether deletion cancels a queued turn or refuses a running one.
+      const active = await tx
+        .select()
+        .from(turns)
+        .where(
+          and(
+            eq(turns.orgId, input.orgId),
+            eq(turns.projectId, input.projectId),
+            eq(turns.storyId, input.storyId),
+            inArray(turns.state, ["queued", "running"]),
+          ),
+        )
+        .for("update");
+      if (active.some((turn) => turn.state === "running")) {
+        throw new StoryServiceError(
+          "workspace_busy",
+          "wait for the running turn to finish before deleting the workspace",
+          409,
+        );
+      }
+      const now = new Date();
+      for (const turn of active) {
+        await tx
+          .update(turns)
+          .set({ state: "canceled", endedAt: now, retryAfter: null, error: null, updatedAt: now })
+          .where(eq(turns.id, turn.id));
+        await appendTurnEvent(tx, {
+          orgId: input.orgId,
+          projectId: input.projectId,
+          storyId: input.storyId,
+          turnId: turn.id,
+          type: "turn.canceled",
+          data: { actor: input.actor, reason: "workspace_deleted" },
+        });
+      }
+      await tx
+        .update(stories)
+        .set({ activeAgentName: null, updatedAt: now })
+        .where(eq(stories.id, input.storyId));
       await tx
         .update(workspaces)
-        .set({ state: "deleting", updatedAt: new Date() })
+        .set({ state: "deleting", updatedAt: now })
         .where(and(eq(workspaces.orgId, input.orgId), eq(workspaces.id, workspace.id)));
       await tx
         .update(previewSessions)
-        .set({ revokedAt: new Date(), updatedAt: new Date() })
+        .set({ revokedAt: now, updatedAt: now })
         .where(
           and(
             eq(previewSessions.orgId, input.orgId),
             eq(previewSessions.workspaceId, workspace.id),
           ),
         );
+      return workspace;
     });
+    if (!workspace) return this.get(input.orgId, input.projectId, input.storyId);
 
     // This is intentionally the only lifecycle path that destroys provider
     // storage. Merge, archive, suspend, reconciliation, and schedule handling
@@ -1808,6 +1875,22 @@ export class StoryWorkspaceService {
       });
     });
     return this.get(input.orgId, input.projectId, input.storyId);
+  }
+
+  private async assertWorkspaceNotDeleting(
+    db: FacilityDb,
+    orgId: string,
+    projectId: string,
+    storyId: string,
+  ) {
+    const workspace = await this.activeWorkspace(orgId, projectId, storyId, true, db);
+    if (workspace && ["deleting", "destroyed"].includes(workspace.state)) {
+      throw new StoryServiceError(
+        "story_workspace_deleted",
+        "story workspace is being deleted or was deleted",
+        409,
+      );
+    }
   }
 
   private async activeWorkspace(

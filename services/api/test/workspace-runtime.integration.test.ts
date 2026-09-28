@@ -92,7 +92,7 @@ describe.skipIf(!enabled)("DockerWorkspaceRuntime integration", () => {
       const deleted = await service.deleteWorkspace(request);
       expect(deleted.workspace?.state).toBe("destroyed");
       expect(deleted.turns.find((item) => item.id === turn.id)?.state).toBe(
-          state === "queued" ? "canceled" : "succeeded",
+        state === "queued" ? "canceled" : "succeeded",
       );
       expect(deleted.attention).toEqual([]);
       expect(await docker.listContainers({ all: true, filters })).toEqual([]);

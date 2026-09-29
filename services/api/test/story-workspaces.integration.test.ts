@@ -920,6 +920,97 @@ environment:
     }
   });
 
+  it("does not wake a workspace deleted after start admission commits", async () => {
+    const input = startInput(`start-delete-gap-${randomUUID()}`);
+    const result = await service.start(input);
+    let first = true;
+    const delayedDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property !== "transaction") return Reflect.get(target, property, receiver);
+        return async (...args: Parameters<typeof db.transaction>) => {
+          const value = await target.transaction(...args);
+          if (first) {
+            first = false;
+            await service.deleteWorkspace({
+              orgId,
+              projectId,
+              storyId: result.story.id,
+              actor: input.actor,
+              confirm: true,
+            });
+          }
+          return value;
+        };
+      },
+    });
+    const wake = vi.spyOn(runtime, "wake");
+    try {
+      await expect(
+        new StoryWorkspaceService(delayedDb, runtime).start(input),
+      ).rejects.toMatchObject({
+        code: "story_workspace_deleted",
+      });
+      expect(wake).not.toHaveBeenCalled();
+      expect((await service.get(orgId, projectId, result.story.id)).workspace?.state).toBe(
+        "destroyed",
+      );
+    } finally {
+      wake.mockRestore();
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])("serializes deletion with an in-flight wake (failure=%s)", async (fails) => {
+    const input = startInput(`start-delete-held-${randomUUID()}`);
+    const result = await service.start(input);
+    let release!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const originalWake = runtime.wake.bind(runtime);
+    const wake = vi.spyOn(runtime, "wake").mockImplementationOnce(async (locator) => {
+      entered();
+      await held;
+      if (fails) throw new Error("wake unavailable");
+      return originalWake(locator);
+    });
+    const destroy = vi.spyOn(runtime, "destroy");
+    const starting = service.start(input).catch((error: unknown) => error);
+    await ready;
+    const deleting = service.deleteWorkspace({
+      orgId,
+      projectId,
+      storyId: result.story.id,
+      actor: input.actor,
+      confirm: true,
+    });
+    try {
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select 1 from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock'
+          and query like '%pg_advisory_xact_lock%'`);
+        expect(waiting.length).toBeGreaterThan(0);
+      });
+      expect(destroy).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await starting;
+      await deleting;
+      wake.mockRestore();
+      destroy.mockRestore();
+    }
+    const final = await service.get(orgId, projectId, result.story.id);
+    expect(final.workspace?.state).toBe("destroyed");
+    expect(final.story.status).toBe("archived");
+    expect(final.story.deletedAt).not.toBeNull();
+  });
+
   it("observes a concurrent worker claim before deciding whether deletion is safe", async () => {
     const result = await service.start(startInput(`delete-race-${randomUUID()}`));
     if (!result.queued.turn) throw new Error("expected queued turn");

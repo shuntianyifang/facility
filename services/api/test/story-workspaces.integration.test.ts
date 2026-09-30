@@ -920,6 +920,112 @@ environment:
     }
   });
 
+  it("does not let an in-flight suspension reopen admission during deletion", async () => {
+    const input = startInput(`suspend-delete-${randomUUID()}`);
+    const result = await service.start(input);
+    let releaseSuspend!: () => void;
+    let enteredSuspend!: () => void;
+    let releaseDestroy!: () => void;
+    let enteredDestroy!: () => void;
+    const suspendHeld = new Promise<void>((resolve) => {
+      releaseSuspend = resolve;
+    });
+    const suspendReady = new Promise<void>((resolve) => {
+      enteredSuspend = resolve;
+    });
+    const destroyHeld = new Promise<void>((resolve) => {
+      releaseDestroy = resolve;
+    });
+    const destroyReady = new Promise<void>((resolve) => {
+      enteredDestroy = resolve;
+    });
+    const originalSuspend = runtime.suspend.bind(runtime);
+    const originalDestroy = runtime.destroy.bind(runtime);
+    const suspend = vi.spyOn(runtime, "suspend").mockImplementationOnce(async (workspace) => {
+      enteredSuspend();
+      await suspendHeld;
+      return originalSuspend(workspace);
+    });
+    const destroy = vi.spyOn(runtime, "destroy").mockImplementationOnce(async (workspace) => {
+      enteredDestroy();
+      await destroyHeld;
+      return originalDestroy(workspace);
+    });
+    const suspending = service.suspend(orgId, projectId, result.story.id);
+    await suspendReady;
+    const deleting = service.deleteWorkspace({
+      orgId,
+      projectId,
+      storyId: result.story.id,
+      actor: input.actor,
+      confirm: true,
+    });
+    try {
+      // The old implementation reaches destroy while suspension is paused.
+      // The fixed implementation waits on the shared story lock instead.
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select 1 from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock'
+          and query like '%pg_advisory_xact_lock%'`);
+        expect(destroy.mock.calls.length > 0 || waiting.length > 0).toBe(true);
+      });
+      releaseSuspend();
+      await suspending;
+      await destroyReady;
+      expect((await service.get(orgId, projectId, result.story.id)).workspace?.state).toBe(
+        "deleting",
+      );
+      await expect(
+        service.queueMessage({
+          orgId,
+          projectId,
+          storyId: result.story.id,
+          actor: input.actor,
+          body: "Must not run during deletion",
+          dedupeKey: randomUUID(),
+          agent: builder,
+          trigger: { type: "manual" },
+        }),
+      ).rejects.toMatchObject({ code: "story_workspace_deleted" });
+    } finally {
+      releaseSuspend();
+      releaseDestroy();
+      await Promise.allSettled([suspending, deleting]);
+      suspend.mockRestore();
+      destroy.mockRestore();
+    }
+    await expect(deleting).resolves.toMatchObject({ workspace: { state: "destroyed" } });
+  });
+
+  it("does not suspend resources once deletion has started or completed", async () => {
+    const input = startInput(`delete-suspend-${randomUUID()}`);
+    const result = await service.start(input);
+    const originalDestroy = runtime.destroy.bind(runtime);
+    const suspend = vi.spyOn(runtime, "suspend");
+    const destroy = vi.spyOn(runtime, "destroy").mockImplementationOnce(async (workspace) => {
+      await expect(service.suspend(orgId, projectId, result.story.id)).resolves.toMatchObject({
+        workspace: { state: "deleting" },
+      });
+      return originalDestroy(workspace);
+    });
+    try {
+      await service.deleteWorkspace({
+        orgId,
+        projectId,
+        storyId: result.story.id,
+        actor: input.actor,
+        confirm: true,
+      });
+      await expect(service.suspend(orgId, projectId, result.story.id)).resolves.toMatchObject({
+        workspace: { state: "destroyed" },
+      });
+      expect(suspend).not.toHaveBeenCalled();
+    } finally {
+      suspend.mockRestore();
+      destroy.mockRestore();
+    }
+  });
+
   it("does not wake a workspace deleted after start admission commits", async () => {
     const input = startInput(`start-delete-gap-${randomUUID()}`);
     const result = await service.start(input);

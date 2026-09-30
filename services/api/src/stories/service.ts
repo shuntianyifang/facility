@@ -1631,14 +1631,20 @@ export class StoryWorkspaceService {
   }
 
   async suspend(orgId: string, projectId: string, storyId: string) {
-    const workspace = await this.activeWorkspace(orgId, projectId, storyId);
-    if (!workspace || workspace.state === "destroyed") return this.get(orgId, projectId, storyId);
-    await this.runtime.suspend(locatorFromRow(workspace));
-    await this.db
-      .update(workspaces)
-      .set({ state: "sleeping", updatedAt: new Date() })
-      .where(and(eq(workspaces.orgId, orgId), eq(workspaces.id, workspace.id)));
-    await appendWorkspaceEvent(this.db, workspace.id, orgId, "workspace.suspended", {});
+    await this.db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as FacilityDb;
+      // Keep provider suspension and its state writeback under deletion's lock.
+      // Re-read after locking so deleting/destroyed workspaces remain untouched.
+      await lockStory(tx, orgId, projectId, storyId);
+      const workspace = await this.activeWorkspace(orgId, projectId, storyId, false, tx);
+      if (!workspace) return;
+      await this.runtime.suspend(locatorFromRow(workspace));
+      await tx
+        .update(workspaces)
+        .set({ state: "sleeping", updatedAt: new Date() })
+        .where(and(eq(workspaces.orgId, orgId), eq(workspaces.id, workspace.id)));
+      await appendWorkspaceEvent(tx, workspace.id, orgId, "workspace.suspended", {});
+    });
     return this.get(orgId, projectId, storyId);
   }
 

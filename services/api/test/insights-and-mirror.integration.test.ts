@@ -775,12 +775,14 @@ describe("cost controls, GitHub mirror, and backlog", async () => {
         .from(githubPullRequests)
         .where(eq(githubPullRequests.repositoryId, repositoryId)),
     ).toContainEqual({ state: "merged" });
-    const backlog = await new ProjectBacklogService(db).list(orgId, projectId, { phase: ["done"] });
+    const backlog = await new ProjectBacklogService(db).list(orgId, projectId, {
+      phase: ["in_progress"],
+    });
     expect(backlog.items).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          phase: "done",
-          reason: "merged",
+          phase: "in_progress",
+          reason: "started",
           issue: expect.objectContaining({ number: 17 }),
           pullRequest: expect.objectContaining({ number: 23, state: "merged" }),
         }),

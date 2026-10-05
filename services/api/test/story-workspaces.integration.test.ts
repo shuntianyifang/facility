@@ -1087,9 +1087,14 @@ environment:
     }
   });
 
-  it("does not let an in-flight suspension reopen admission during deletion", async () => {
+  it.each([
+    "manual",
+    "issue closure",
+  ] as const)("does not let an in-flight %s suspension reopen admission during deletion", async (source) => {
     const input = startInput(`suspend-delete-${randomUUID()}`);
-    const result = await service.start(input);
+    const issue = source === "issue closure" ? await issueFixture(7004) : undefined;
+    const result = issue ? issue.result : await service.start(input);
+    if (issue) await issue.finish();
     let releaseSuspend!: () => void;
     let enteredSuspend!: () => void;
     let releaseDestroy!: () => void;
@@ -1118,7 +1123,9 @@ environment:
       await destroyHeld;
       return originalDestroy(workspace);
     });
-    const suspending = service.suspend(orgId, projectId, result.story.id);
+    const suspending = issue
+      ? issue.observe("closed", "2026-10-05T10:00:00Z")
+      : service.suspend(orgId, projectId, result.story.id);
     await suspendReady;
     const deleting = service.deleteWorkspace({
       orgId,
@@ -1164,13 +1171,25 @@ environment:
     await expect(deleting).resolves.toMatchObject({ workspace: { state: "destroyed" } });
   });
 
-  it("does not suspend resources once deletion has started or completed", async () => {
+  it.each([
+    "manual",
+    "issue closure",
+  ] as const)("does not suspend resources via %s once deletion has started or completed", async (source) => {
     const input = startInput(`delete-suspend-${randomUUID()}`);
-    const result = await service.start(input);
+    const issue = source === "issue closure" ? await issueFixture(7005) : undefined;
+    const result = issue ? issue.result : await service.start(input);
+    if (issue) await issue.finish();
+    const suspendWorkspace = async () => {
+      if (issue) {
+        await issue.observe("closed", "2026-10-05T11:00:00Z");
+        return service.get(orgId, projectId, result.story.id);
+      }
+      return service.suspend(orgId, projectId, result.story.id);
+    };
     const originalDestroy = runtime.destroy.bind(runtime);
     const suspend = vi.spyOn(runtime, "suspend");
     const destroy = vi.spyOn(runtime, "destroy").mockImplementationOnce(async (workspace) => {
-      await expect(service.suspend(orgId, projectId, result.story.id)).resolves.toMatchObject({
+      await expect(suspendWorkspace()).resolves.toMatchObject({
         workspace: { state: "deleting" },
       });
       return originalDestroy(workspace);
@@ -1183,7 +1202,7 @@ environment:
         actor: input.actor,
         confirm: true,
       });
-      await expect(service.suspend(orgId, projectId, result.story.id)).resolves.toMatchObject({
+      await expect(suspendWorkspace()).resolves.toMatchObject({
         workspace: { state: "destroyed" },
       });
       expect(suspend).not.toHaveBeenCalled();
